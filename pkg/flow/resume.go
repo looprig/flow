@@ -265,12 +265,18 @@ func (c *coordinator[S]) resumeStep(ctx context.Context, cp *Checkpoint, rerun [
 	if err != nil {
 		return nil, err
 	}
+	// Carry the already-committed terminals so every intermediate StepRunning
+	// checkpoint this step writes lists the FULL step (§9.3, §10.1 — C1): a crash
+	// after such a checkpoint must not drop them, or the next Resume re-runs a Done
+	// vertex. Cleared after the boundary so fresh steps in c.loop carry nothing.
+	c.carry = terminalStates(cp)
 	outcome, err := c.classifyStep(ctx, runs)
 	if err != nil {
 		return nil, err
 	}
 	combined := c.foldTerminals(cp, runs, outcome)
 	res, done, err := c.finalizeStep(ctx, combined, outcome)
+	c.carry = nil
 	if err != nil {
 		return nil, err
 	}
@@ -412,6 +418,20 @@ func (c *coordinator[S]) foldTerminals(cp *Checkpoint, runs []*vertexRun[S], out
 	return combined
 }
 
+// terminalStates returns the already-committed TERMINAL VertexStates (Done /
+// Failed-Route) of a checkpoint's step — the records a resumed step must carry into
+// every intermediate StepRunning checkpoint so a mid-resume crash does not drop
+// them (§9.3, §10.1). Paused vertices (re-run on resume) are excluded.
+func terminalStates(cp *Checkpoint) []VertexState {
+	var out []VertexState
+	for _, vs := range cp.Vertices {
+		if isTerminal(vs, cp) {
+			out = append(out, vs)
+		}
+	}
+	return out
+}
+
 // stepBaseState decodes the checkpoint's frozen step base into S so re-run
 // vertices derive their inputs from the SAME base the original step used (§9.2.2).
 // A StepBase absent (the seed has none) falls back to the committed State.
@@ -430,8 +450,11 @@ func (c *coordinator[S]) stepBaseState(cp *Checkpoint) (S, error) {
 // stepFrontier returns the full vertex set of the checkpoint's step: the Frontier
 // the most recent prior StepRouted boundary routed INTO this step (§10.1: a
 // StepRunning checkpoint does not itself carry that frontier, so it is re-derived
-// from History). It falls back to the checkpoint's own Frontier if no prior
-// boundary is found (defensive).
+// from History). The seed ALWAYS writes a StepRouted boundary at revision 0
+// (Frontier == [entry]), so a StepRunning checkpoint (revision ≥ 1) is guaranteed
+// at least one prior StepRouted boundary — the empty-frontier fallback to the
+// checkpoint's own Frontier is therefore unreachable in a well-formed history and
+// kept only as a fail-secure floor (a History read error likewise falls back).
 func (c *coordinator[S]) stepFrontier(ctx context.Context, cp *Checkpoint) []VertexID {
 	hist, err := c.store.History(ctx, cp.Run.GraphRunID)
 	if err != nil {

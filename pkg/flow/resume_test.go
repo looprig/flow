@@ -910,3 +910,118 @@ func TestResumeFinishRanReDerived(t *testing.T) {
 		t.Fatalf("Status = %v, want RunCompleted (finishRan re-derived ⇒ drained frontier completes)", res.Run.Status)
 	}
 }
+
+// --- crash DURING a resumed step (intermediate StepRunning carry) -------------
+
+// crashAfterStore wraps a CheckpointStore and fails the Nth Append (1-based) with
+// a sentinel error, simulating a process crash AFTER an intermediate StepRunning
+// checkpoint is durably written but before the step's final boundary. All other
+// ops delegate to the inner store, so the durable history reflects exactly the
+// appends that succeeded before the crash — which a later Resume reads as Latest.
+type crashAfterStore struct {
+	inner   CheckpointStore
+	failOn  int          // the 1-based append number to fail (0 = never)
+	appends atomic.Int32 // total Append calls observed
+}
+
+var errSimulatedCrash = errors.New("simulated crash")
+
+func (s *crashAfterStore) Append(ctx context.Context, cp *Checkpoint) error {
+	n := s.appends.Add(1)
+	if s.failOn != 0 && int(n) == s.failOn {
+		return errSimulatedCrash // the prior appends are durable; this one "crashes"
+	}
+	return s.inner.Append(ctx, cp)
+}
+
+func (s *crashAfterStore) Latest(ctx context.Context, id GraphRunID) (*Checkpoint, error) {
+	return s.inner.Latest(ctx, id)
+}
+
+func (s *crashAfterStore) History(ctx context.Context, id GraphRunID) ([]*Checkpoint, error) {
+	return s.inner.History(ctx, id)
+}
+
+// TestResumeCrashMidStepDoesNotReRunTerminal is the C1 regression test (§9.3,
+// §10.1): in PerVertex mode a resumed step writes intermediate StepRunning
+// checkpoints; if such a checkpoint dropped the step's already-committed
+// Done/Failed-Route terminals, a crash there would make the NEXT resume re-run a
+// Done vertex (double execution + state double-count). It builds a fan-out step
+// where A succeeds (Done) and B pauses (Awaiting), crashes Resume #1 right after
+// B's intermediate StepRunning append, then resumes #2 from that checkpoint and
+// proves A's task ran only ONCE total and its reduction is not duplicated.
+func TestResumeCrashMidStepDoesNotReRunTerminal(t *testing.T) {
+	t.Parallel()
+
+	var aRuns, bSeen atomic.Int32
+	mem := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	a, b := vID(2), vID(3)
+	addErrVertex(t, g, vID(1), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "entry", nil }))
+	// A always succeeds; a re-run would bump aRuns past 1 and double-fold "a-done".
+	addErrVertex(t, g, a, NewFuncTask(func(_ context.Context, _ int) (string, error) {
+		aRuns.Add(1)
+		return "a-done", nil
+	}))
+	// B pauses Awaiting once, then succeeds.
+	addErrVertex(t, g, b, NewFuncTask(func(ctx context.Context, _ int) (string, error) {
+		if bSeen.Add(1) == 1 {
+			return "", Interrupt(ctx, "approve b")
+		}
+		return "b-done", nil
+	}))
+	addErrVertex(t, g, vID(4), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "fin", nil }))
+	r, _, _, _, _ := fanOutTwo(t, g, mem)
+
+	// Initial Run: step 1 pauses with A=Done, B=Awaiting (a StepPaused boundary).
+	id := resumeOnce(t, r, mem)
+	if aRuns.Load() != 1 {
+		t.Fatalf("A ran %d times before resume, want 1", aRuns.Load())
+	}
+
+	// Resume #1 over a crashing store: the resumed step re-runs only B; the FIRST
+	// append of this resume is B's intermediate StepRunning checkpoint, so fail the
+	// 2nd append (1st succeeds = the intermediate, 2nd = the would-be boundary) —
+	// leaving an intermediate StepRunning checkpoint as the durable Latest.
+	crash := &crashAfterStore{inner: mem, failOn: 2}
+	rCrash, err := compileOver(t, g, crash)
+	if err != nil {
+		t.Fatalf("compile over crash store: %v", err)
+	}
+	_, err = rCrash.Resume(context.Background(), id, nil)
+	if !errors.Is(err, errSimulatedCrash) {
+		t.Fatalf("Resume #1 error = %v, want the simulated crash (an intermediate StepRunning must be durable first)", err)
+	}
+	last := lastCheckpoint(t, mem, id)
+	if last.Phase != StepRunning {
+		t.Fatalf("Latest Phase after crash = %v, want StepRunning (the intermediate checkpoint)", last.Phase)
+	}
+
+	// Resume #2 over the clean MemStore from that intermediate StepRunning Latest.
+	res, err := r.Resume(context.Background(), id, nil)
+	if err != nil {
+		t.Fatalf("Resume #2: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+	if aRuns.Load() != 1 {
+		t.Errorf("A ran %d times total, want 1 — a Done terminal must NOT re-run after a mid-resume crash", aRuns.Load())
+	}
+	aCount := 0
+	for _, v := range res.State.Vals {
+		if v == "a-done" {
+			aCount++
+		}
+	}
+	if aCount != 1 {
+		t.Errorf("'a-done' appears %d times in final State, want 1 (no reducer double-count)", aCount)
+	}
+}
+
+// compileOver compiles g over the given store, returning the Runner. It mirrors
+// the inline Compile calls but threads an arbitrary CheckpointStore wrapper.
+func compileOver(t *testing.T, g *Graph[cnt], store CheckpointStore) (*Runner[cnt], error) {
+	t.Helper()
+	return g.Compile(vID(1), vID(4), WithStore(store))
+}

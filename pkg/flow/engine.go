@@ -48,6 +48,15 @@ type coordinator[S any] struct {
 	frontier     []VertexID
 	stepBaseJSON json.RawMessage
 	finishRan    bool
+	// carry holds the already-committed TERMINAL VertexStates (Done / Failed-Route)
+	// of the step a Resume is re-running, so every intermediate PerVertex
+	// StepRunning checkpoint written during that resumed step lists the FULL step,
+	// not just the re-run subset (§9.3, §10.1). Without it a crash after an
+	// intermediate checkpoint would drop those terminals and the next Resume would
+	// re-run a Done vertex. It is nil on the Run path (the full frontier is always
+	// in runs) and on fresh steps within a resumed run's loop; resumeStep sets it
+	// before classifyStep and clears it after finalizeStep.
+	carry []VertexState
 }
 
 // newCoordinator constructs a coordinator for one run from the runner, the
@@ -442,14 +451,47 @@ func (c *coordinator[S]) pauseErrored(r *vertexRun[S], out *stepOutcome[S]) {
 // accumulated so far, so a paused vertex's InterruptRecord (and any continuation)
 // survives a crash before the step's final boundary checkpoint. classifyStep gates
 // this call on granularity == PerVertex; in PerStep it is never invoked.
+//
+// The recorded Vertices are this step's re-run records MERGED with c.carry — the
+// already-committed terminal records of a resumed step (§9.3) — so an intermediate
+// StepRunning checkpoint lists the FULL step. On the Run path c.carry is nil, so
+// this is exactly vertexStates(runs); on a resumed step it restores the terminals
+// a crash here would otherwise drop, keeping a mid-resume crash recoverable.
 func (c *coordinator[S]) checkpointVertex(ctx context.Context, runs []*vertexRun[S], records []InterruptRecord) error {
 	cp, err := c.checkpoint(StepRunning)
 	if err != nil {
 		return err
 	}
-	cp.Vertices = vertexStates(runs)
+	cp.Vertices = mergeVertexStates(vertexStates(runs), c.carry)
 	cp.Interrupts = records
 	return c.append(ctx, cp)
+}
+
+// mergeVertexStates returns the union of two per-vertex record sets, deduped by
+// VertexID (a record in `runs` wins over a carried one of the same id, though by
+// construction they are disjoint — a carried vertex is terminal and never in the
+// re-run set) and sorted by VertexID for deterministic checkpoints matching the
+// Run path's full-frontier StepRunning records.
+func mergeVertexStates(runs, carry []VertexState) []VertexState {
+	if len(carry) == 0 {
+		return runs
+	}
+	seen := make(map[VertexID]struct{}, len(runs))
+	merged := make([]VertexState, 0, len(runs)+len(carry))
+	for _, vs := range runs {
+		seen[vs.VertexID] = struct{}{}
+		merged = append(merged, vs)
+	}
+	for _, vs := range carry {
+		if _, dup := seen[vs.VertexID]; dup {
+			continue
+		}
+		merged = append(merged, vs)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].VertexID.String() < merged[j].VertexID.String()
+	})
+	return merged
 }
 
 // pauseFor returns the Interruption recorded for r in this step (if r paused) so
