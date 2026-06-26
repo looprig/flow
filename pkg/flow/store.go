@@ -36,6 +36,11 @@ import (
 // compare-and-append on (GraphRunID, Revision), latest-revision-as-source-of-
 // truth, ordered History, structural immutability of stored checkpoints, and a
 // CheckpointNotFoundError for an unknown run. Every method honors ctx.
+//
+// SECURITY (durable backends): a backend that decodes UNTRUSTED stored bytes on
+// read (§10.4) MUST bound the payload size and nesting before decoding, to guard
+// against oversized or deeply-nested input (CLAUDE.md: guard against unbounded
+// sizes). MemStore is exempt only because its bytes are self-produced in-memory.
 type CheckpointStore interface {
 	// Append durably records cp iff cp.Run.Revision is the next revision in
 	// sequence for cp.Run.GraphRunID (compare-and-append). Otherwise it returns a
@@ -85,6 +90,8 @@ func (s *MemStore) Append(ctx context.Context, cp *Checkpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// The count IS the next required revision: compare-and-append forbids gaps,
+	// so stored revisions are always the contiguous 0..len-1 and len == latest+1.
 	next := uint64(len(s.runs[cp.Run.GraphRunID]))
 	if cp.Run.Revision != next {
 		return &RevisionConflictError{
