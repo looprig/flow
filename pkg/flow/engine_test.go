@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -654,28 +655,31 @@ func TestRunCycleHaltMaxSteps(t *testing.T) {
 }
 
 // TestRunDeadEndHalt proves a frontier that drains WITHOUT finish executing halts
-// as a run-level HaltDeadEnd. CONSTRUCTION: entry -> a (static); a has no static
-// out-edge but a conditional edge to finish, so the graph COMPILES (finish is
-// reachable via the conditional Target, which checkReachable follows) yet at
-// runtime 6.2 routes only over static edges (graph.edges), so a's static
-// successors are empty, the frontier drains, and finish never ran.
+// as a run-level HaltDeadEnd — a GENUINE dead end that survives conditional
+// routing (§9.5/§9.8). CONSTRUCTION: entry -> a (static); a has a conditional edge
+// with Targets [b, fin] whose Pick deterministically returns [b]; b is a TRUE SINK
+// (no static OR conditional out-edge) and b != fin. The graph COMPILES because fin
+// is reachable as a declared conditional Target, yet at runtime the run routes
+// a -> b, b drains, and finish never executes — a real dead end no router can
+// rescue, distinct from the prior static-only-ignored-conditional fixture.
 func TestRunDeadEndHalt(t *testing.T) {
 	t.Parallel()
 
 	store := NewMemStore()
 	g := NewGraph[cnt](GraphID{})
-	entry, a, fin := vID(1), vID(2), vID(3)
+	entry, a, b, fin := vID(1), vID(2), vID(3), vID(4)
 	tagVertex(t, g, entry, "entry")
 	tagVertex(t, g, a, "a")
+	tagVertex(t, g, b, "b")
 	tagVertex(t, g, fin, "fin")
 	if err := g.AddEdge(entry, a); err != nil {
 		t.Fatalf("AddEdge(entry->a): %v", err)
 	}
-	// a's only outward topology is a conditional edge to finish: it satisfies
-	// compile reachability but is NOT a static edge, so 6.2 never traverses it.
+	// a's conditional edge declares [b, fin] (so fin is reachable and compile
+	// passes) but Pick always routes to the SINK b; b has no out-edge at all.
 	cond := Condition[cnt]{
-		Targets: []VertexID{fin},
-		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { return []VertexID{fin}, nil },
+		Targets: []VertexID{b, fin},
+		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { return []VertexID{b}, nil },
 	}
 	if err := g.AddConditionalEdge(a, cond); err != nil {
 		t.Fatalf("AddConditionalEdge(a): %v", err)
@@ -1532,5 +1536,381 @@ func TestReduceOrderIsVertexIDStable(t *testing.T) {
 	wantOrder := []string{want[0].String(), want[1].String(), want[2].String()}
 	if !reflect.DeepEqual(res.State.Order, wantOrder) {
 		t.Errorf("reduce Order = %v, want %v (VertexID-sorted, §9.4)", res.State.Order, wantOrder)
+	}
+}
+
+// --- Task 6.5: conditional routing (Condition.Pick) + routing halts -----------
+
+// condGraph builds a graph over cnt with a single conditional edge from `from`
+// carrying the given Condition, plus inert tag vertices for every id in `verts`.
+// It wires no static edges from `from` (a vertex has EITHER static OR conditional
+// routing, never both). It returns the compiled Runner; callers add any extra
+// static edges before calling via the prep callback.
+func condGraph(
+	t *testing.T, store CheckpointStore, entry, finish, from VertexID,
+	cond Condition[cnt], verts []VertexID, prep func(g *Graph[cnt]),
+) *Runner[cnt] {
+	t.Helper()
+	g := NewGraph[cnt](GraphID{})
+	for _, id := range verts {
+		tagVertex(t, g, id, id.String())
+	}
+	if prep != nil {
+		prep(g)
+	}
+	if err := g.AddConditionalEdge(from, cond); err != nil {
+		t.Fatalf("AddConditionalEdge(%v): %v", from, err)
+	}
+	r, err := g.Compile(entry, finish, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	return r
+}
+
+// TestRunConditionalSingleTarget proves a conditional edge whose Pick returns one
+// declared target routes there: entry -> (Pick:[finish]) -> finish completes, the
+// recorded RouteRecord is {From:entry, To:[finish], Conditional:true}, and OnEdge
+// fires for (entry, finish).
+func TestRunConditionalSingleTarget(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	entry, fin := vID(1), vID(2)
+	cond := Condition[cnt]{
+		Targets: []VertexID{fin},
+		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { return []VertexID{fin}, nil },
+	}
+	r := condGraph(t, store, entry, fin, entry, cond, []VertexID{entry, fin}, nil)
+
+	rc := &recorder{}
+	res, err := r.Run(context.Background(), cnt{}, WithHooks(rc.hooks()))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+
+	var saw bool
+	for _, rec := range routesFor(t, store, res.Run.GraphRunID) {
+		if rec.From != entry {
+			continue
+		}
+		saw = true
+		if !rec.Conditional {
+			t.Errorf("conditional route Conditional = false, want true")
+		}
+		if len(rec.To) != 1 || rec.To[0] != fin {
+			t.Errorf("conditional route To = %v, want [%v]", rec.To, fin)
+		}
+	}
+	if !saw {
+		t.Error("no RouteRecord with From == entry (conditional route not recorded)")
+	}
+	rc.mu.Lock()
+	edges := rc.edges
+	rc.mu.Unlock()
+	if edges != 1 {
+		t.Errorf("OnEdge fired %d times, want 1 (entry->finish)", edges)
+	}
+}
+
+// TestRunConditionalFanOut proves a Pick returning TWO declared targets activates
+// both in the next super-step (a conditional fan-out): entry -> (Pick:[a,b]); both
+// a and b route to finish; both run exactly once and the run completes.
+func TestRunConditionalFanOut(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	entry, a, b, fin := vID(1), vID(2), vID(3), vID(4)
+	cond := Condition[cnt]{
+		Targets: []VertexID{a, b},
+		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { return []VertexID{a, b}, nil },
+	}
+	r := condGraph(t, store, entry, fin, entry, cond, []VertexID{entry, a, b, fin}, func(g *Graph[cnt]) {
+		for _, e := range [][2]VertexID{{a, fin}, {b, fin}} {
+			if err := g.AddEdge(e[0], e[1]); err != nil {
+				t.Fatalf("AddEdge(%v->%v): %v", e[0], e[1], err)
+			}
+		}
+	})
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+	// entry(+1), a,b(+2 in one step), fin(+1) == 4 reductions.
+	if res.State.N != 4 {
+		t.Errorf("State.N = %d, want 4 (entry + a + b + fin)", res.State.N)
+	}
+}
+
+// chstate is a conditional-routing state whose reducer sets Choice, so a Pick can
+// read the POST-reduce committed state S_{N+1} (proving Pick sees the freshly
+// committed value, not the step's frozen base).
+type chstate struct {
+	Choice string
+	Vals   []string
+}
+
+// TestRunConditionalPickReadsCommittedState proves Pick reads S_{N+1}: entry's
+// reducer sets Choice from a seeded want; entry's Pick reads Choice and routes to
+// left or right accordingly. Both directions are tested.
+func TestRunConditionalPickReadsCommittedState(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		choice string
+		want   string // "left" or "right" tag expected in Vals after the chosen branch
+	}{
+		{name: "choice left routes left", choice: "left", want: "left"},
+		{name: "choice right routes right", choice: "right", want: "right"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewMemStore()
+			g := NewGraph[chstate](GraphID{})
+			entry, left, right := vID(1), vID(2), vID(3)
+
+			noTask := NewFuncTask(func(_ context.Context, _ int) (string, error) { return "", nil })
+			noSel := func(_ chstate) int { return 0 }
+			// entry's reducer commits the seeded Choice into S (so Pick reads S_{N+1}).
+			choice := tt.choice
+			entryRed := func(s *chstate, _ string) error { s.Choice = choice; return nil }
+			if err := AddVertex(g, entry, noTask, noSel, entryRed); err != nil {
+				t.Fatalf("AddVertex(entry): %v", err)
+			}
+			mkBranch := func(id VertexID, tag string) {
+				red := func(s *chstate, _ string) error { s.Vals = append(s.Vals, tag); return nil }
+				if err := AddVertex(g, id, noTask, noSel, red); err != nil {
+					t.Fatalf("AddVertex(%s): %v", tag, err)
+				}
+			}
+			mkBranch(left, "left")
+			mkBranch(right, "right")
+
+			cond := Condition[chstate]{
+				Targets: []VertexID{left, right},
+				Pick: func(_ context.Context, s chstate) ([]VertexID, error) {
+					if s.Choice == "left" {
+						return []VertexID{left}, nil
+					}
+					return []VertexID{right}, nil
+				},
+			}
+			if err := g.AddConditionalEdge(entry, cond); err != nil {
+				t.Fatalf("AddConditionalEdge(entry): %v", err)
+			}
+			// left/right are sinks; finish is whichever branch we expect to run, so the
+			// run completes when the chosen branch runs.
+			finish := left
+			if tt.want == "right" {
+				finish = right
+			}
+			r, err := g.Compile(entry, finish, WithStore(store))
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+
+			res, err := r.Run(context.Background(), chstate{})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res.Run.Status != RunCompleted {
+				t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+			}
+			if len(res.State.Vals) != 1 || res.State.Vals[0] != tt.want {
+				t.Errorf("Vals = %v, want [%s] (Pick read committed Choice=%q)", res.State.Vals, tt.want, tt.choice)
+			}
+		})
+	}
+}
+
+// assertRoutingHalt asserts a run halted with the given kind, set Result.Halt (not
+// an engine error), RunInterrupted, nil Interrupts, a StepHalted final checkpoint,
+// and OnHalt firing exactly once. It returns the halt cause for further inspection.
+func assertRoutingHalt(t *testing.T, r *Runner[cnt], store CheckpointStore, kind HaltKind) error {
+	t.Helper()
+	rc := &recorder{}
+	res, err := r.Run(context.Background(), cnt{}, WithHooks(rc.hooks()))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil (halt is a Result, not an error)", err)
+	}
+	if res.Halt == nil {
+		t.Fatalf("Result.Halt is nil, want halt kind %v", kind)
+	}
+	if res.Halt.Kind != kind {
+		t.Fatalf("Halt.Kind = %v, want %v", res.Halt.Kind, kind)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Errorf("Status = %v, want RunInterrupted", res.Run.Status)
+	}
+	if res.Interrupts != nil {
+		t.Errorf("Result.Interrupts = %v, want nil (mutually exclusive with Halt)", res.Interrupts)
+	}
+	hist, err := store.History(context.Background(), res.Run.GraphRunID)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	last := hist[len(hist)-1]
+	if last.Phase != StepHalted {
+		t.Errorf("last checkpoint Phase = %v, want StepHalted", last.Phase)
+	}
+	if last.Halt == nil || last.Halt.Kind != kind {
+		t.Errorf("last checkpoint Halt = %+v, want kind %v", last.Halt, kind)
+	}
+	rc.mu.Lock()
+	halts := rc.halts
+	rc.mu.Unlock()
+	if halts != 1 {
+		t.Errorf("OnHalt fired %d times, want 1", halts)
+	}
+	return res.Halt.Cause
+}
+
+// TestRunConditionalEmptySetHalt proves a Pick returning an empty set is a routing
+// halt HaltUndeclaredTarget whose cause is an *UndeclaredTargetError with a zero
+// Target (the empty-return sentinel) — a Result halt, not an engine error.
+func TestRunConditionalEmptySetHalt(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	entry, fin := vID(1), vID(2)
+	cond := Condition[cnt]{
+		Targets: []VertexID{fin},
+		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { return nil, nil },
+	}
+	r := condGraph(t, store, entry, fin, entry, cond, []VertexID{entry, fin}, nil)
+
+	cause := assertRoutingHalt(t, r, store, HaltUndeclaredTarget)
+	var ute *UndeclaredTargetError
+	if !errors.As(cause, &ute) {
+		t.Fatalf("Halt.Cause = %v, want *UndeclaredTargetError", cause)
+	}
+	if ute.From != entry {
+		t.Errorf("UndeclaredTargetError.From = %v, want %v", ute.From, entry)
+	}
+	if ute.Target != (VertexID{}) {
+		t.Errorf("UndeclaredTargetError.Target = %v, want zero (empty-return sentinel)", ute.Target)
+	}
+}
+
+// TestRunConditionalUndeclaredTargetHalt proves a Pick returning a target NOT in
+// its declared Targets is a routing halt HaltUndeclaredTarget naming the offending
+// target — a Result halt, not an engine error.
+func TestRunConditionalUndeclaredTargetHalt(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	entry, fin, rogue := vID(1), vID(2), vID(9)
+	cond := Condition[cnt]{
+		Targets: []VertexID{fin},
+		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { return []VertexID{rogue}, nil },
+	}
+	r := condGraph(t, store, entry, fin, entry, cond, []VertexID{entry, fin}, nil)
+
+	cause := assertRoutingHalt(t, r, store, HaltUndeclaredTarget)
+	var ute *UndeclaredTargetError
+	if !errors.As(cause, &ute) {
+		t.Fatalf("Halt.Cause = %v, want *UndeclaredTargetError", cause)
+	}
+	if ute.Target != rogue {
+		t.Errorf("UndeclaredTargetError.Target = %v, want %v (the offending id)", ute.Target, rogue)
+	}
+	if ute.From != entry {
+		t.Errorf("UndeclaredTargetError.From = %v, want %v", ute.From, entry)
+	}
+}
+
+// TestRunConditionalPickErrorHalt proves a Pick returning a non-nil error is a
+// routing halt HaltCondition whose cause is a *ConditionError wrapping the Pick
+// error — a Result halt, not an engine error.
+func TestRunConditionalPickErrorHalt(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	entry, fin := vID(1), vID(2)
+	pickErr := errors.New("pick blew up")
+	cond := Condition[cnt]{
+		Targets: []VertexID{fin},
+		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { return nil, pickErr },
+	}
+	r := condGraph(t, store, entry, fin, entry, cond, []VertexID{entry, fin}, nil)
+
+	cause := assertRoutingHalt(t, r, store, HaltCondition)
+	var ce *ConditionError
+	if !errors.As(cause, &ce) {
+		t.Fatalf("Halt.Cause = %v, want *ConditionError", cause)
+	}
+	if ce.From != entry {
+		t.Errorf("ConditionError.From = %v, want %v", ce.From, entry)
+	}
+	if !errors.Is(cause, pickErr) {
+		t.Errorf("Halt.Cause does not wrap the Pick error %v", pickErr)
+	}
+}
+
+// TestRunConditionalPickPanicHalt proves a Pick that PANICS is recovered (never
+// crashes the run) and surfaces as a routing halt HaltCondition whose cause is a
+// *ConditionError mentioning "panic" — a Result halt, not an engine error.
+func TestRunConditionalPickPanicHalt(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	entry, fin := vID(1), vID(2)
+	cond := Condition[cnt]{
+		Targets: []VertexID{fin},
+		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { panic("boom") },
+	}
+	r := condGraph(t, store, entry, fin, entry, cond, []VertexID{entry, fin}, nil)
+
+	cause := assertRoutingHalt(t, r, store, HaltCondition)
+	var ce *ConditionError
+	if !errors.As(cause, &ce) {
+		t.Fatalf("Halt.Cause = %v, want *ConditionError", cause)
+	}
+	if ce.From != entry {
+		t.Errorf("ConditionError.From = %v, want %v", ce.From, entry)
+	}
+	if !strings.Contains(cause.Error(), "panic") {
+		t.Errorf("Halt.Cause = %q, want it to mention \"panic\"", cause.Error())
+	}
+}
+
+// TestRunConditionalCycleHaltMaxSteps proves conditional back-edges traverse: a
+// Pick that routes back to entry forms a cycle that never reaches finish, so under
+// WithMaxSteps it eventually halts HaltMaxSteps (the conditional router followed
+// the back-edge every step).
+func TestRunConditionalCycleHaltMaxSteps(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	entry, fin := vID(1), vID(2)
+	// entry's conditional edge declares [entry, fin] but always Picks entry: an
+	// infinite conditional self-cycle that the step budget must cut off.
+	cond := Condition[cnt]{
+		Targets: []VertexID{entry, fin},
+		Pick:    func(_ context.Context, _ cnt) ([]VertexID, error) { return []VertexID{entry}, nil },
+	}
+	r := condGraph(t, store, entry, fin, entry, cond, []VertexID{entry, fin}, nil)
+
+	const max = 5
+	res, err := r.Run(context.Background(), cnt{}, WithMaxSteps(max))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil", err)
+	}
+	if res.Halt == nil || res.Halt.Kind != HaltMaxSteps {
+		t.Fatalf("Halt = %+v, want HaltMaxSteps (conditional back-edge cycle)", res.Halt)
+	}
+	var mse *MaxStepsExceededError
+	if !errors.As(res.Halt.Cause, &mse) {
+		t.Fatalf("Halt.Cause = %v, want *MaxStepsExceededError", res.Halt.Cause)
 	}
 }

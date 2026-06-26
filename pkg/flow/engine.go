@@ -3,6 +3,7 @@ package flow
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -14,14 +15,15 @@ import (
 // coordinator goroutine commits it (vertex goroutines return outputs; the
 // coordinator reduces them single-threaded in VertexID order, §9.4).
 //
-// SCOPE: static-edge routing (§9.2 steps 1–6) — fan-out (a vertex with several
-// static out-edges activates them all), fan-in (a vertex reached by several edges
-// is deduped to one frontier entry, §9.6), and the two STRUCTURAL run-level halts
-// (HaltMaxSteps and HaltDeadEnd, §9.5/§9.8). Route + terminate are folded into one
-// boundary checkpoint per step (finalizeStep). The concurrency bound, conditional
-// routing (HaltCondition/HaltUndeclaredTarget), error policy, interrupts/pause,
-// PerStep behavior, and Resume are later sub-tasks. The loop and frontier model
-// are structured so those extensions slot in without reworking the skeleton.
+// SCOPE: static AND conditional routing (§9.2 steps 1–6, §7) — fan-out (a vertex
+// with several static out-edges, or a Condition.Pick returning several declared
+// targets, activates them all), fan-in (a vertex reached by several edges is
+// deduped to one frontier entry, §9.6), and the run-level halts: the structural
+// HaltMaxSteps/HaltDeadEnd and the routing HaltCondition/HaltUndeclaredTarget
+// (§9.5/§9.8). Route + terminate are folded into one boundary checkpoint per step
+// (finalizeStep). Error policy, interrupts/pause, PerStep behavior, and Resume are
+// later sub-tasks. The loop and frontier model are structured so those extensions
+// slot in without reworking the skeleton.
 
 // coordinator drives one graph run's super-step loop (§9.2). It is unexported and
 // single-use: Run builds one per call. It is the sole writer of state; the
@@ -273,24 +275,41 @@ func (c *coordinator[S]) reduceStep(ctx context.Context, runs []*vertexRun[S]) e
 	return nil
 }
 
+// routeHalt signals that routing produced a run-level halt (§9.8): a Condition
+// Pick that errored/panicked (HaltCondition) or returned an empty/undeclared
+// target set (HaltUndeclaredTarget). A nil *routeHalt means routing succeeded.
+// computeRoutes returns it so finalizeStep can convert it to a Result halt before
+// the complete/dead-end/advance dispatch.
+type routeHalt struct {
+	kind  HaltKind
+	cause error
+}
+
 // finalizeStep performs §9.2.5–9.2.6 as ONE step boundary (the route+terminate
-// fold): it computes the static routing decisions and the next deduped frontier
+// fold): it computes the routing decisions and the next deduped frontier
 // (§9.5/§9.6), sets c.frontier to it, then writes EXACTLY ONE boundary checkpoint
 // and decides the step's fate. It returns (result, done, err): done with a
 // non-nil result completes or halts the run; done false advances to the next
-// step. Three outcomes:
+// step. Outcomes (in order):
+//   - routing halt (a Condition Pick errored/panicked or returned an
+//     empty/undeclared target) — HaltCondition/HaltUndeclaredTarget (§9.5/§9.8);
 //   - complete (frontier empty AND finish ran in some step) — §9.5;
 //   - dead end (frontier empty, finish never ran) — HaltDeadEnd (§9.5/§9.8);
 //   - advance (frontier non-empty) — append the StepRouted boundary and continue.
-//
-// Only static AddEdge out-edges are routed; conditional routing is a later
-// sub-task.
 func (c *coordinator[S]) finalizeStep(ctx context.Context, runs []*vertexRun[S]) (*Result[S], bool, error) {
-	routes, next := c.computeRoutes(runs)
+	routes, next, halt := c.computeRoutes(ctx, runs)
+	if halt != nil {
+		// Halt.Step here is the step that drained/failed routing (the routing/dead-end
+		// sense), not the step refused/not-started (the HaltMaxSteps sense, §9.5).
+		res, err := c.haltRun(ctx, halt.kind, halt.cause, runs)
+		return res, true, err
+	}
 	c.frontier = next
 
 	if len(next) == 0 {
 		if !c.finishRan {
+			// Dead-end Halt.Step is the step whose frontier drained (cf. HaltMaxSteps,
+			// whose Halt.Step is the step refused at the loop top).
 			res, err := c.haltRun(ctx, HaltDeadEnd, &DeadEndError{Step: c.rs.Step}, runs)
 			return res, true, err
 		}
@@ -299,21 +318,71 @@ func (c *coordinator[S]) finalizeStep(ctx context.Context, runs []*vertexRun[S])
 	return c.advance(ctx, runs, routes, next)
 }
 
-// computeRoutes derives, from the step's executed vertices, the static routing
-// decisions (one RouteRecord per from with ≥1 out-edge, Conditional false) and
-// the next frontier as the deduped, VertexID-sorted union of all successors
-// (§9.5 routing, §9.6 fan-in dedup). It mutates nothing.
-func (c *coordinator[S]) computeRoutes(runs []*vertexRun[S]) ([]RouteRecord, []VertexID) {
+// computeRoutes derives, from the step's executed vertices (in VertexID order),
+// the routing decisions and the next deduped, VertexID-sorted frontier (§9.5
+// routing, §9.6 fan-in dedup). A vertex routes via its STATIC out-edges if it has
+// any (Conditional false), else via its Condition.Pick if it has one (Conditional
+// true, §7), else it is a sink (no successors). The FIRST routing halt in VertexID
+// order wins; on a halt it returns (nil, nil, halt). It mutates nothing.
+func (c *coordinator[S]) computeRoutes(ctx context.Context, runs []*vertexRun[S]) ([]RouteRecord, []VertexID, *routeHalt) {
 	var routes []RouteRecord
 	next := newVertexSet()
 	for _, r := range runs {
-		succ := c.graph.edges[r.vs.VertexID]
-		if len(succ) > 0 {
-			routes = append(routes, RouteRecord{From: r.vs.VertexID, To: succ, Conditional: false})
+		from := r.vs.VertexID
+		if succ := c.graph.edges[from]; len(succ) > 0 {
+			routes = append(routes, RouteRecord{From: from, To: succ, Conditional: false})
+			next.addAll(succ)
+			continue
 		}
-		next.addAll(succ)
+		cond, ok := c.graph.conds[from]
+		if !ok {
+			continue // sink: no static edge, no conditional edge
+		}
+		picked, halt := c.evalCondition(ctx, from, cond)
+		if halt != nil {
+			return nil, nil, halt
+		}
+		routes = append(routes, RouteRecord{From: from, To: picked, Conditional: true})
+		next.addAll(picked)
 	}
-	return routes, next.ordered()
+	return routes, next.ordered(), nil
+}
+
+// evalCondition runs from's Condition.Pick over the committed state (S_{N+1},
+// since computeRoutes runs post-reduce) under panic recovery (§12.5) and validates
+// the result (§7/§9.5): a panic or non-nil error is a HaltCondition; an empty set
+// or any target outside cond.Targets is a HaltUndeclaredTarget. On success it
+// returns the picked targets and a nil halt. Pick is READ-ONLY and gets the plain
+// run ctx — routing is a decision, not a task, so no RunInfo/Self is injected.
+func (c *coordinator[S]) evalCondition(ctx context.Context, from VertexID, cond Condition[S]) ([]VertexID, *routeHalt) {
+	picked, err := recoverPick(ctx, cond.Pick, c.state)
+	if err != nil {
+		return nil, &routeHalt{kind: HaltCondition, cause: &ConditionError{From: from, Err: err}}
+	}
+	if len(picked) == 0 {
+		return nil, &routeHalt{kind: HaltUndeclaredTarget, cause: &UndeclaredTargetError{From: from}}
+	}
+	declared := newVertexSet()
+	declared.addAll(cond.Targets)
+	for _, t := range picked {
+		if _, ok := declared.seen[t]; !ok {
+			return nil, &routeHalt{kind: HaltUndeclaredTarget, cause: &UndeclaredTargetError{From: from, Target: t}}
+		}
+	}
+	return picked, nil
+}
+
+// recoverPick invokes a Condition.Pick under panic recovery (§12.5): a panic is
+// converted to an error (so a misbehaving Pick halts the run rather than crashing
+// the coordinator), and the Pick's own error is returned unchanged. It is the sole
+// trust boundary around user routing code.
+func recoverPick[S any](ctx context.Context, pick func(context.Context, S) ([]VertexID, error), s S) (picked []VertexID, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			picked, err = nil, fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return pick(ctx, s)
 }
 
 // complete finalizes a completed run (§9.2.6, §9.5): mark Completed/CompletedAt,
@@ -366,8 +435,12 @@ func (c *coordinator[S]) fireRouting(ctx context.Context, routes []RouteRecord, 
 	c.cfg.hooks.onStep(ctx, c.rs, activated)
 }
 
-// haltRun records a run-level structural halt (§9.5, §9.8) — HaltMaxSteps or
-// HaltDeadEnd here — as a Result, NEVER an engine error. It marks the run
+// haltRun records a run-level halt (§9.5, §9.8) — the structural HaltMaxSteps /
+// HaltDeadEnd and the routing HaltCondition / HaltUndeclaredTarget — as a Result,
+// NEVER an engine error. Note Halt.Step (c.rs.Step) means the step REFUSED /
+// not-started for HaltMaxSteps (caught at the loop top before any vertex runs) but
+// the step that DRAINED / FAILED ROUTING for the routing and dead-end halts
+// (caught in finalizeStep after the step's vertices reduced). It marks the run
 // RunInterrupted/InterruptedAt, appends a StepHalted checkpoint whose StepBase and
 // State are BOTH the committed state (a halt's resume re-derives the frontier's
 // inputs from the committed state, so the base IS the current state — overriding
