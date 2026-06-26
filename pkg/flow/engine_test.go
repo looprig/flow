@@ -2412,3 +2412,318 @@ func TestRunSuccessReducerErrorPauses(t *testing.T) {
 		t.Errorf("OnInterrupt fired %d times, want 1", got)
 	}
 }
+
+// --- Task 6.7: interrupt hardening (§9.7) -----------------------------------
+
+// fanOutTwo wires entry -> {a, b} -> finish over cnt and compiles it, returning
+// the four vertex ids (entry, a, b, finish) so a fan-out pause test can make a
+// and b reach their terminal states in the SAME super-step (step 1). finish is a
+// distinct sink so it never runs when the step pauses, isolating the a/b outcome.
+func fanOutTwo(t *testing.T, g *Graph[cnt], store CheckpointStore) (*Runner[cnt], VertexID, VertexID, VertexID, VertexID) {
+	t.Helper()
+	entry, a, b, fin := vID(1), vID(2), vID(3), vID(4)
+	for _, e := range [][2]VertexID{{entry, a}, {entry, b}, {a, fin}, {b, fin}} {
+		if err := g.AddEdge(e[0], e[1]); err != nil {
+			t.Fatalf("AddEdge(%v->%v): %v", e[0], e[1], err)
+		}
+	}
+	r, err := g.Compile(entry, fin, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	return r, entry, a, b, fin
+}
+
+// interruptTask returns a Task that always pauses Awaiting with the given reason.
+func interruptTask(reason string) Task[int, string] {
+	return NewFuncTask(func(ctx context.Context, _ int) (string, error) {
+		return "", Interrupt(ctx, reason)
+	})
+}
+
+// recordFor returns the StepPaused InterruptRecord for vertex v, or fails.
+func recordFor(t *testing.T, cp *Checkpoint, v VertexID) InterruptRecord {
+	t.Helper()
+	for _, rec := range cp.Interrupts {
+		if rec.Vertex == v {
+			return rec
+		}
+	}
+	t.Fatalf("no InterruptRecord for vertex %v in %+v", v, cp.Interrupts)
+	return InterruptRecord{}
+}
+
+// TestRunPluralPauses proves two sibling vertices that BOTH flow.Interrupt in the
+// same super-step produce two pauses (§9.7): Result.Interrupts has both
+// (VertexID-sorted), RunInterrupted, Halt nil, the StepPaused checkpoint carries
+// two records and a frontier of both paused vertices, OnInterrupt fired TWICE,
+// and it is NOT an engine error.
+func TestRunPluralPauses(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	addErrVertex(t, g, vID(1), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "entry", nil }))
+	addErrVertex(t, g, vID(2), interruptTask("approve A"))
+	addErrVertex(t, g, vID(3), interruptTask("approve B"))
+	addErrVertex(t, g, vID(4), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "fin", nil }))
+	r, _, a, b, fin := fanOutTwo(t, g, store)
+
+	er := &errRecorder{}
+	res, err := r.Run(context.Background(), cnt{}, WithHooks(er.hooks()))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil (plural pause is a Result)", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Errorf("Status = %v, want RunInterrupted", res.Run.Status)
+	}
+	if res.Halt != nil {
+		t.Errorf("Halt = %+v, want nil (mutually exclusive with Interrupts)", res.Halt)
+	}
+	if len(res.Interrupts) != 2 {
+		t.Fatalf("Interrupts = %+v, want exactly 2 (both siblings paused)", res.Interrupts)
+	}
+	if res.Interrupts[0].Vertex != a || res.Interrupts[1].Vertex != b {
+		t.Errorf("Interrupts vertices = [%v %v], want [%v %v] (VertexID-sorted)",
+			res.Interrupts[0].Vertex, res.Interrupts[1].Vertex, a, b)
+	}
+	for _, iv := range res.Interrupts {
+		if iv.Kind != Awaiting {
+			t.Errorf("Interruption %v Kind = %v, want Awaiting", iv.Vertex, iv.Kind)
+		}
+	}
+	last := lastCheckpoint(t, store, res.Run.GraphRunID)
+	if last.Phase != StepPaused {
+		t.Fatalf("last Phase = %v, want StepPaused", last.Phase)
+	}
+	if len(last.Interrupts) != 2 {
+		t.Errorf("StepPaused has %d records, want 2", len(last.Interrupts))
+	}
+	if len(last.Frontier) != 2 || last.Frontier[0] != a || last.Frontier[1] != b {
+		t.Errorf("StepPaused Frontier = %v, want [%v %v] (both paused vertices)", last.Frontier, a, b)
+	}
+	for _, v := range []VertexID{a, b} {
+		if rec := recordFor(t, last, v); len(rec.Info) == 0 {
+			t.Errorf("record for %v has empty Info", v)
+		}
+	}
+	if fin == (VertexID{}) {
+		t.Fatal("finish id unexpectedly zero")
+	}
+	er.mu.Lock()
+	got := er.interrupts
+	er.mu.Unlock()
+	if got != 2 {
+		t.Errorf("OnInterrupt fired %d times, want 2 (one per paused sibling)", got)
+	}
+}
+
+// TestRunRoutePlusPauseCoexist proves a step with ONE Failed-under-Route vertex
+// AND ONE Awaiting vertex PAUSES (§9.7): the error-route handler does NOT enter
+// the next frontier (it waits for resume), the record-reducer fold IS committed,
+// Result.Interrupts contains ONLY the Awaiting pause (the routable vertex is not
+// paused), and OnInterrupt fired once.
+func TestRunRoutePlusPauseCoexist(t *testing.T) {
+	t.Parallel()
+
+	var counter int32
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	a, b, handler := vID(2), vID(3), vID(5)
+	record := func(s *cnt, e error) error {
+		s.Vals = append(s.Vals, "recorded:"+e.Error())
+		return nil
+	}
+	// entry fans out to a (fails -> routes to handler) and b (interrupts).
+	addErrVertex(t, g, vID(1), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "entry", nil }))
+	addErrVertex(t, g, a, failTask(99, "never", &counter),
+		WithRetry[cnt](RetryPolicy{MaxAttempts: 1}),
+		WithErrorRoute[cnt](handler, record))
+	addErrVertex(t, g, b, interruptTask("approve B"))
+	addErrVertex(t, g, vID(4), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "fin", nil }))
+	addErrVertex(t, g, handler, NewFuncTask(func(_ context.Context, _ int) (string, error) { return "handled", nil }))
+	r, _, _, _, _ := fanOutTwo(t, g, store)
+
+	er := &errRecorder{}
+	res, err := r.Run(context.Background(), cnt{}, WithHooks(er.hooks()))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil (pause coexists, not an error)", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Fatalf("Status = %v, want RunInterrupted (the step pauses, never routes)", res.Run.Status)
+	}
+	if len(res.Interrupts) != 1 {
+		t.Fatalf("Interrupts = %+v, want exactly 1 (only the Awaiting pause)", res.Interrupts)
+	}
+	if res.Interrupts[0].Vertex != b || res.Interrupts[0].Kind != Awaiting {
+		t.Errorf("Interrupt = {%v %v}, want {%v Awaiting} (routable vertex is NOT paused)",
+			res.Interrupts[0].Vertex, res.Interrupts[0].Kind, b)
+	}
+	if res.Interrupts[0].Vertex == a {
+		t.Error("Failed-Route vertex a appears in Interrupts; it is routable, not paused")
+	}
+	last := lastCheckpoint(t, store, res.Run.GraphRunID)
+	if last.Phase != StepPaused {
+		t.Fatalf("last Phase = %v, want StepPaused", last.Phase)
+	}
+	// The handler waits for resume: it must NOT be in the paused frontier.
+	for _, f := range last.Frontier {
+		if f == handler {
+			t.Errorf("handler %v is in the paused frontier %v, want it to wait for resume", handler, last.Frontier)
+		}
+	}
+	// The record-reducer fold IS committed even though the step paused.
+	foundRecorded, foundHandled := false, false
+	for _, v := range res.State.Vals {
+		if strings.HasPrefix(v, "recorded:") {
+			foundRecorded = true
+		}
+		if v == "handled" {
+			foundHandled = true
+		}
+	}
+	if !foundRecorded {
+		t.Errorf("State.Vals = %v, want a 'recorded:' fold (the record reducer committed)", res.State.Vals)
+	}
+	if foundHandled {
+		t.Errorf("State.Vals = %v, want NO 'handled' (handler waits for resume)", res.State.Vals)
+	}
+	er.mu.Lock()
+	got := er.interrupts
+	er.mu.Unlock()
+	if got != 1 {
+		t.Errorf("OnInterrupt fired %d times, want 1 (only the Awaiting pause)", got)
+	}
+}
+
+// TestRunSiblingsNotCancelledOnPause proves a slow sibling runs to COMPLETION when
+// another sibling pauses (§9.7): the barrier waits for the slow vertex, its reducer
+// commits into the final State, and the pause is still recorded. Siblings are never
+// cancelled by a peer's pause.
+func TestRunSiblingsNotCancelledOnPause(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	a, b := vID(2), vID(3)
+	// a is the slow sibling that must finish; b pauses.
+	addErrVertex(t, g, vID(1), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "entry", nil }))
+	addErrVertex(t, g, a, NewFuncTask(func(_ context.Context, _ int) (string, error) {
+		time.Sleep(20 * time.Millisecond)
+		return "slow-done", nil
+	}))
+	addErrVertex(t, g, b, interruptTask("pause while sibling runs"))
+	addErrVertex(t, g, vID(4), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "fin", nil }))
+	r, _, _, _, _ := fanOutTwo(t, g, store)
+
+	res, err := r.Run(context.Background(), cnt{}, WithConcurrency(2))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Fatalf("Status = %v, want RunInterrupted", res.Run.Status)
+	}
+	// The slow sibling's reducer committed its contribution into the final State.
+	foundSlow := false
+	for _, v := range res.State.Vals {
+		if v == "slow-done" {
+			foundSlow = true
+		}
+	}
+	if !foundSlow {
+		t.Errorf("State.Vals = %v, want 'slow-done' (slow sibling ran to completion, not cancelled)", res.State.Vals)
+	}
+	// The pause is still recorded.
+	if len(res.Interrupts) != 1 || res.Interrupts[0].Vertex != b {
+		t.Fatalf("Interrupts = %+v, want exactly one pause for %v", res.Interrupts, b)
+	}
+	last := lastCheckpoint(t, store, res.Run.GraphRunID)
+	if last.Phase != StepPaused {
+		t.Errorf("last Phase = %v, want StepPaused", last.Phase)
+	}
+	// The slow sibling is Done in the per-vertex records (it committed, not paused).
+	for _, vs := range last.Vertices {
+		if vs.VertexID == a && vs.Status != VertexDone {
+			t.Errorf("slow sibling %v Status = %v, want VertexDone (completed despite peer pause)", a, vs.Status)
+		}
+	}
+}
+
+// TestRunStatefulInterruptContinuationPersisted proves a StatefulInterrupt's
+// continuation is durably recorded (§10.1): the StepPaused checkpoint's matching
+// InterruptRecord carries a non-empty Continuation whose bytes round-trip back to
+// the original value, and Info likewise. (Resume restore is Task 6.10.)
+func TestRunStatefulInterruptContinuationPersisted(t *testing.T) {
+	t.Parallel()
+
+	type cont struct {
+		Cursor int
+		Note   string
+	}
+	want := cont{Cursor: 42, Note: "resume here"}
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, NewFuncTask(func(ctx context.Context, _ int) (string, error) {
+		return "", StatefulInterrupt(ctx, "need approval", want)
+	}))
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Fatalf("Status = %v, want RunInterrupted", res.Run.Status)
+	}
+	last := lastCheckpoint(t, store, res.Run.GraphRunID)
+	rec := recordFor(t, last, entry)
+	if len(rec.Continuation) == 0 {
+		t.Fatal("StatefulInterrupt record has empty Continuation, want the marshaled continuation")
+	}
+	var gotCont cont
+	if err := json.Unmarshal(rec.Continuation, &gotCont); err != nil {
+		t.Fatalf("Continuation does not unmarshal: %v", err)
+	}
+	if gotCont != want {
+		t.Errorf("Continuation round-trip = %+v, want %+v", gotCont, want)
+	}
+	var gotInfo string
+	if err := json.Unmarshal(rec.Info, &gotInfo); err != nil || gotInfo != "need approval" {
+		t.Errorf("Info round-trip = %q (err %v), want %q", gotInfo, err, "need approval")
+	}
+}
+
+// TestRunStatefulInterruptUnserializableContinuationErrors proves the fail-secure
+// path (I-3, §12.3): a StatefulInterrupt whose continuation cannot be marshaled
+// (it contains a chan) makes Run return a non-nil ENGINE error (a *codecError),
+// never a Result with a silently-empty continuation.
+func TestRunStatefulInterruptUnserializableContinuationErrors(t *testing.T) {
+	t.Parallel()
+
+	type badCont struct {
+		Ch chan int // channels are not JSON-serializable
+	}
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, NewFuncTask(func(ctx context.Context, _ int) (string, error) {
+		return "", StatefulInterrupt(ctx, "need approval", badCont{Ch: make(chan int)})
+	}))
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err == nil {
+		t.Fatalf("Run returned nil error and res %+v, want a fail-secure engine error (no silent drop)", res)
+	}
+	var ce *codecError
+	if !errors.As(err, &ce) {
+		t.Fatalf("Run error = %v, want a *codecError (fail-secure marshal failure)", err)
+	}
+}

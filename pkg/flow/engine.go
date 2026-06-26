@@ -289,7 +289,9 @@ func (o *stepOutcome[S]) paused() bool { return len(o.pauses) > 0 }
 func (c *coordinator[S]) classifyStep(ctx context.Context, runs []*vertexRun[S]) (*stepOutcome[S], error) {
 	out := newStepOutcome[S]()
 	for _, r := range runs {
-		c.classifyVertex(r, out)
+		if err := c.classifyVertex(r, out); err != nil {
+			return nil, err
+		}
 		if r.vs.Status == VertexDone && r.vs.VertexID == c.finish {
 			c.finishRan = true
 		}
@@ -307,20 +309,22 @@ func (c *coordinator[S]) classifyStep(ctx context.Context, runs []*vertexRun[S])
 // classifyVertex drives one vertex to its single terminal state and records its
 // effect into out (§9.2.4, §12.2). Success reduces (a success-path reducer error
 // falls through to the error policy, §12.5); a flow.Interrupt pauses Awaiting; a
-// *VertexError applies the error policy (Route or default Pause).
-func (c *coordinator[S]) classifyVertex(r *vertexRun[S], out *stepOutcome[S]) {
+// *VertexError applies the error policy (Route or default Pause). It returns an
+// engine error ONLY when an Awaiting pause's record cannot be durably marshaled
+// (fail secure, §12.3); every other terminal state is recorded into out.
+func (c *coordinator[S]) classifyVertex(r *vertexRun[S], out *stepOutcome[S]) error {
 	if r.err == nil {
 		err := c.reduceSuccess(r)
 		if err == nil {
-			return
+			return nil
 		}
 		r.err = err // success-path reducer error follows the error policy (§12.5)
 	}
 	if sig, ok := asInterrupt(r.err); ok {
-		c.pauseAwaiting(r, sig, out)
-		return
+		return c.pauseAwaiting(r, sig, out)
 	}
 	c.applyErrorPolicy(r, out)
+	return nil
 }
 
 // reduceSuccess clone-and-commits a successful vertex's reducer into the
@@ -344,8 +348,15 @@ func (c *coordinator[S]) reduceSuccess(r *vertexRun[S]) error {
 
 // pauseAwaiting records a flow.Interrupt pause (§9.2.4): the vertex is Interrupted,
 // no reducer runs, and an Awaiting Interruption + InterruptRecord (Info, and the
-// continuation if StatefulInterrupt) are accumulated for the step boundary.
-func (c *coordinator[S]) pauseAwaiting(r *vertexRun[S], sig *interruptSignal, out *stepOutcome[S]) {
+// continuation if StatefulInterrupt) are accumulated for the step boundary. The
+// durable record is built FIRST: if its Info/Continuation cannot be marshaled the
+// pause is not recorded at all and a *codecError engine error is returned (fail
+// secure, §12.3) — never a partial pause that drops the task's continuation.
+func (c *coordinator[S]) pauseAwaiting(r *vertexRun[S], sig *interruptSignal, out *stepOutcome[S]) error {
+	rec, err := awaitingRecord(r.vs.VertexID, sig)
+	if err != nil {
+		return err
+	}
 	r.vs.Status = VertexInterrupted
 	r.vs.InterruptedAt = time.Now()
 	out.pauses = append(out.pauses, Interruption{
@@ -354,7 +365,8 @@ func (c *coordinator[S]) pauseAwaiting(r *vertexRun[S], sig *interruptSignal, ou
 		Kind:       Awaiting,
 		Info:       sig.info,
 	})
-	out.records = append(out.records, awaitingRecord(r.vs.VertexID, sig))
+	out.records = append(out.records, rec)
+	return nil
 }
 
 // applyErrorPolicy applies a vertex's *VertexError outcome per §12.2: WithErrorRoute
@@ -441,25 +453,36 @@ func pauseFor[S any](r *vertexRun[S], out *stepOutcome[S]) (Interruption, bool) 
 
 // awaitingRecord builds the durable InterruptRecord for a flow.Interrupt pause,
 // marshaling the user reason into Info and (for a StatefulInterrupt) the live
-// continuation into Continuation — the §10.1 serialization boundary. A failed
-// marshal yields a nil RawMessage (omitted on write); full continuation hardening
-// is Task 6.7.
-func awaitingRecord(v VertexID, sig *interruptSignal) InterruptRecord {
-	rec := InterruptRecord{Vertex: v, Kind: Awaiting, Info: marshalRaw(sig.info)}
-	if sig.stateful {
-		rec.Continuation = marshalRaw(sig.continuation)
+// continuation into Continuation — the §10.1 serialization boundary. A FAILED
+// marshal of either present value is an ENGINE error (a *codecError): a pause whose
+// record cannot be durably written cannot be a durable pause (fail secure, §12.3),
+// so the classify phase aborts the run rather than recording a partial/empty
+// interrupt that would silently lose the task's place on resume.
+func awaitingRecord(v VertexID, sig *interruptSignal) (InterruptRecord, error) {
+	info, err := marshalRaw(sig.info)
+	if err != nil {
+		return InterruptRecord{}, err
 	}
-	return rec
+	rec := InterruptRecord{Vertex: v, Kind: Awaiting, Info: info}
+	if sig.stateful {
+		cont, err := marshalRaw(sig.continuation)
+		if err != nil {
+			return InterruptRecord{}, err
+		}
+		rec.Continuation = cont
+	}
+	return rec, nil
 }
 
-// marshalRaw marshals v to a json.RawMessage, returning nil on a marshal error so
-// the field is omitted rather than poisoning the checkpoint (fail secure, §10.1).
-func marshalRaw(v any) json.RawMessage {
+// marshalRaw marshals v to a json.RawMessage, returning a *codecError on a marshal
+// failure so a non-serializable interrupt payload fails the run securely rather
+// than being silently dropped from the checkpoint (fail secure, §10.1, §12.3).
+func marshalRaw(v any) (json.RawMessage, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
-		return nil
+		return nil, &codecError{Op: "marshal", Err: err}
 	}
-	return b
+	return b, nil
 }
 
 // recoverReduce runs a reducer (or error-route record reducer) under panic recovery
