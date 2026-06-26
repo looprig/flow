@@ -45,6 +45,10 @@ type RetryPolicy struct {
 //   - a *VertexError{...Attempt} on any task failure — a panic OR an exhausted
 //     / non-retryable returned error — wrapping the underlying cause.
 //
+// On any non-nil error, the returned out is UNSPECIFIED: a failing or paused
+// task's partial output is meaningless, so the coordinator drives reduce/route/
+// pause off the error and reads out only when err == nil.
+//
 // A panic in the task, in policy.Retryable, or in policy.Backoff is itself a
 // task failure: it is recovered (it never escapes) and surfaced as a
 // *VertexError. The backoff wait honors ctx; a cancellation during the wait
@@ -57,6 +61,8 @@ func runWithRetry(ctx context.Context, rinfo RunInfo, policy *RetryPolicy, exec 
 	if policy != nil && policy.MaxAttempts > 0 {
 		maxAttempts = policy.MaxAttempts
 	}
+	// maxAttempts >= 1 (clamped above), so the attempt >= maxAttempts guard below
+	// always terminates the loop; every other branch returns as well.
 	for attempt := 1; ; attempt++ {
 		out, cause := recoverExec(ctx, exec)
 		if cause == nil {
