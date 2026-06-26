@@ -71,12 +71,19 @@ func newCoordinator[S any](r *Runner[S], cfg runConfig, id GraphRunID, in S) *co
 }
 
 // vertexRun pairs a vertex's per-execution record with its task output, carrying
-// one frontier vertex's result from the run phase to the reduce phase.
+// one frontier vertex's result from the run phase to the classify-and-reduce
+// phase. err is the outcome of runWithRetry (§12.2): nil on success, the
+// interrupt signal on a flow.Interrupt pause (passed through unwrapped), or a
+// *VertexError on a task failure after retry. out is set only when err is nil (a
+// failed/paused task's partial output is meaningless, §12.2). The coordinator
+// classifies each run off err, never off out, so a non-nil err drives the
+// reduce/route/pause decision.
 type vertexRun[S any] struct {
 	v   *vertex[S]
 	vs  VertexState
 	in  any
 	out any
+	err error
 }
 
 // run executes the full super-step loop to a terminal state (§9.2). It seeds the
@@ -101,10 +108,11 @@ func (c *coordinator[S]) run(ctx context.Context) (*Result[S], error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := c.reduceStep(ctx, runs); err != nil {
+		outcome, err := c.classifyStep(ctx, runs)
+		if err != nil {
 			return nil, err
 		}
-		res, done, err := c.finalizeStep(ctx, runs)
+		res, done, err := c.finalizeStep(ctx, runs, outcome)
 		if err != nil {
 			return nil, err
 		}
@@ -215,11 +223,14 @@ func (c *coordinator[S]) prepareRuns(stepBase S) ([]*vertexRun[S], error) {
 	return runs, nil
 }
 
-// execVertex runs one vertex's task under its retry policy (§9.2.3), injecting the
-// run identity and self record into ctx so the task can read Info/Self. It writes
-// only out and Attempt on the vertexRun (read after the barrier, so race-free);
-// StartedAt is stamped by the coordinator in runStep before launch. On the happy
-// path the error is nil; error policy is a later sub-task.
+// execVertex runs one vertex's task under its retry policy and per-vertex timeout
+// (§9.2.3, §12.2), injecting the run identity and self record into ctx so the task
+// can read Info/Self. It writes out, err, and Attempt on the vertexRun (read after
+// the barrier, so race-free); StartedAt is stamped by the coordinator in runStep
+// before launch. WithTimeout (config.timeout > 0) wraps a per-vertex deadline that
+// SPANS all retry attempts (§12.2): a task that observes tctx.Done() and returns
+// yields a *VertexError wrapping context.DeadlineExceeded via runWithRetry,
+// retryable by default. The classify-and-reduce phase drives the outcome off err.
 func (c *coordinator[S]) execVertex(ctx context.Context, r *vertexRun[S]) {
 	rinfo := RunInfo{
 		GraphID:     c.rs.GraphID,
@@ -229,50 +240,238 @@ func (c *coordinator[S]) execVertex(ctx context.Context, r *vertexRun[S]) {
 		Step:        c.rs.Step,
 	}
 	vctx := withSelf(withRunInfo(ctx, rinfo), r.vs)
+	if r.v.config.timeout > 0 {
+		tctx, cancel := context.WithTimeout(vctx, r.v.config.timeout)
+		defer cancel()
+		vctx = tctx
+	}
 	out, attempts, err := runWithRetry(vctx, rinfo, r.v.config.retry, func(ec context.Context) (any, error) {
 		return r.v.execute(ec, r.in)
 	})
 	r.vs.Attempt = attempts
+	r.err = err
 	if err == nil {
 		r.out = out
 	}
 }
 
-// reduceStep performs §9.2.4 (PerVertex): in VertexID order, clone-and-commit
-// each vertex's reducer into the accumulator (so a reducer that mutates then
-// errors leaves S unchanged), mark the vertex Done, and append a per-vertex
-// checkpoint reflecting the new state. It fires OnVertexFinish + OnCheckpoint per
-// vertex. When the finish vertex is among the executed vertices it latches
-// finishRan (the run-spanning completion signal of §9.5, set on the step finish
-// runs, never cleared). The happy path has no reducer/clone error; full error
-// policy is later.
-func (c *coordinator[S]) reduceStep(ctx context.Context, runs []*vertexRun[S]) error {
+// stepOutcome accumulates the classify-and-reduce phase's per-step results (§9.2.4)
+// so finalizeStep can make the route-or-pause decision (§9.2.5). pauses holds the
+// in-memory Interruption per paused vertex (Awaiting or Errored-Pause), records
+// the matching durable InterruptRecords (carried in every per-vertex StepRunning
+// checkpoint and the final boundary checkpoint, §10.1), and routable maps each
+// Failed-under-Route vertex to its error-route handler so computeRoutes can
+// activate the handler — but ONLY when no vertex paused (§9.2.5). A non-empty
+// pauses means the step pauses and does not route.
+type stepOutcome[S any] struct {
+	pauses   []Interruption
+	records  []InterruptRecord
+	routable map[VertexID]VertexID // failed vertex -> error-route handler
+}
+
+func newStepOutcome[S any]() *stepOutcome[S] {
+	return &stepOutcome[S]{routable: make(map[VertexID]VertexID)}
+}
+
+// paused reports whether any vertex in the step reached a paused terminal state
+// (Awaiting or Errored-Pause). When true the step PAUSES and never routes (§9.2.5).
+func (o *stepOutcome[S]) paused() bool { return len(o.pauses) > 0 }
+
+// classifyStep performs §9.2.4 (PerVertex): in VertexID order each vertex reaches
+// exactly ONE terminal state via classifyVertex — Done (success reduced), Awaiting
+// (flow.Interrupt), Failed-Route (record reduced, handler activated), or
+// Errored-Pause (default Pause, or a record-reducer/success-reducer failure). After
+// each vertex's terminal effect it appends a StepRunning checkpoint carrying the
+// accumulated Interrupts so far (§10.1 — a paused vertex's checkpoint already
+// carries its InterruptRecord), fires OnVertexFinish, and fires OnInterrupt once
+// for a paused vertex. finishRan latches only on a Done finish (a paused/failed
+// finish has not executed to completion, §9.5).
+func (c *coordinator[S]) classifyStep(ctx context.Context, runs []*vertexRun[S]) (*stepOutcome[S], error) {
+	out := newStepOutcome[S]()
 	for _, r := range runs {
-		if r.vs.VertexID == c.finish {
+		c.classifyVertex(r, out)
+		if r.vs.Status == VertexDone && r.vs.VertexID == c.finish {
 			c.finishRan = true
 		}
-		next, err := clone(c.state)
-		if err != nil {
-			return err
-		}
-		if err := r.v.applyReducer(&next, r.out); err != nil {
-			return err
-		}
-		c.state = next
-		r.vs.Status = VertexDone
-		r.vs.CompletedAt = time.Now()
-
-		cp, err := c.checkpoint(StepRunning)
-		if err != nil {
-			return err
-		}
-		cp.Vertices = vertexStates(runs)
-		if err := c.append(ctx, cp); err != nil {
-			return err
+		if err := c.checkpointVertex(ctx, runs, out.records); err != nil {
+			return nil, err
 		}
 		c.cfg.hooks.onVertexFinish(ctx, r.vs)
+		if iv, ok := pauseFor(r, out); ok {
+			c.cfg.hooks.onInterrupt(ctx, iv)
+		}
 	}
+	return out, nil
+}
+
+// classifyVertex drives one vertex to its single terminal state and records its
+// effect into out (§9.2.4, §12.2). Success reduces (a success-path reducer error
+// falls through to the error policy, §12.5); a flow.Interrupt pauses Awaiting; a
+// *VertexError applies the error policy (Route or default Pause).
+func (c *coordinator[S]) classifyVertex(r *vertexRun[S], out *stepOutcome[S]) {
+	if r.err == nil {
+		err := c.reduceSuccess(r)
+		if err == nil {
+			return
+		}
+		r.err = err // success-path reducer error follows the error policy (§12.5)
+	}
+	if sig, ok := asInterrupt(r.err); ok {
+		c.pauseAwaiting(r, sig, out)
+		return
+	}
+	c.applyErrorPolicy(r, out)
+}
+
+// reduceSuccess clone-and-commits a successful vertex's reducer into the
+// accumulator and marks it Done (§9.2.4). On a nil reducer error it commits and
+// returns nil; on a reducer error (or recovered reducer panic, §12.5) the clone is
+// discarded — S is unchanged — and the error is returned so the caller applies the
+// vertex's error policy.
+func (c *coordinator[S]) reduceSuccess(r *vertexRun[S]) error {
+	next, err := clone(c.state)
+	if err != nil {
+		return err
+	}
+	if err := recoverReduce(func() error { return r.v.applyReducer(&next, r.out) }); err != nil {
+		return err
+	}
+	c.state = next
+	r.vs.Status = VertexDone
+	r.vs.CompletedAt = time.Now()
 	return nil
+}
+
+// pauseAwaiting records a flow.Interrupt pause (§9.2.4): the vertex is Interrupted,
+// no reducer runs, and an Awaiting Interruption + InterruptRecord (Info, and the
+// continuation if StatefulInterrupt) are accumulated for the step boundary.
+func (c *coordinator[S]) pauseAwaiting(r *vertexRun[S], sig *interruptSignal, out *stepOutcome[S]) {
+	r.vs.Status = VertexInterrupted
+	r.vs.InterruptedAt = time.Now()
+	out.pauses = append(out.pauses, Interruption{
+		GraphRunID: c.rs.GraphRunID,
+		Vertex:     r.vs.VertexID,
+		Kind:       Awaiting,
+		Info:       sig.info,
+	})
+	out.records = append(out.records, awaitingRecord(r.vs.VertexID, sig))
+}
+
+// applyErrorPolicy applies a vertex's *VertexError outcome per §12.2: WithErrorRoute
+// folds the error via the record reducer and activates the handler next (Failed); a
+// record-reducer failure pauses Errored instead (no recursive route). The default
+// (no error route) pauses Errored.
+func (c *coordinator[S]) applyErrorPolicy(r *vertexRun[S], out *stepOutcome[S]) {
+	if route := r.v.config.errorRoute; route != nil {
+		if c.applyErrorRoute(r, route) {
+			out.routable[r.vs.VertexID] = route.handler
+			return
+		}
+	}
+	c.pauseErrored(r, out)
+}
+
+// applyErrorRoute clone-and-commits the error-route record reducer (§12.2): on a
+// nil error it commits, marks the vertex Failed-under-Route, and reports true
+// (routable to the handler). On a record-reducer error (or recovered panic, §12.5)
+// the clone is discarded — S unchanged — and it reports false so the vertex pauses
+// Errored instead (no recursive route).
+func (c *coordinator[S]) applyErrorRoute(r *vertexRun[S], route *errorRoute[S]) bool {
+	next, err := clone(c.state)
+	if err != nil {
+		return false
+	}
+	if err := recoverReduce(func() error { return route.record(&next, r.err) }); err != nil {
+		return false
+	}
+	c.state = next
+	r.vs.Status = VertexFailed
+	r.vs.FailedAt = time.Now()
+	return true
+}
+
+// pauseErrored records a default-Pause failure (§9.2.4, §12.2): the vertex is
+// Failed, no reducer runs, and an Errored Interruption (carrying the underlying
+// cause) + InterruptRecord (Cause message) are accumulated for the step boundary.
+func (c *coordinator[S]) pauseErrored(r *vertexRun[S], out *stepOutcome[S]) {
+	r.vs.Status = VertexFailed
+	r.vs.FailedAt = time.Now()
+	out.pauses = append(out.pauses, Interruption{
+		GraphRunID: c.rs.GraphRunID,
+		Vertex:     r.vs.VertexID,
+		Kind:       Errored,
+		Cause:      r.err,
+	})
+	out.records = append(out.records, InterruptRecord{
+		Vertex: r.vs.VertexID,
+		Kind:   Errored,
+		Cause:  r.err.Error(),
+	})
+}
+
+// checkpointVertex appends a per-vertex StepRunning checkpoint (PerVertex, §10.1)
+// carrying the step's per-vertex records and the interrupt records accumulated so
+// far, so a paused vertex's InterruptRecord (and any continuation) survives a crash
+// before the step's final boundary checkpoint.
+func (c *coordinator[S]) checkpointVertex(ctx context.Context, runs []*vertexRun[S], records []InterruptRecord) error {
+	cp, err := c.checkpoint(StepRunning)
+	if err != nil {
+		return err
+	}
+	cp.Vertices = vertexStates(runs)
+	cp.Interrupts = records
+	return c.append(ctx, cp)
+}
+
+// pauseFor returns the Interruption recorded for r in this step (if r paused) so
+// the caller can fire OnInterrupt exactly once per paused vertex. A vertex pauses
+// iff its status is VertexInterrupted (Awaiting) or VertexFailed without a routable
+// handler (Errored-Pause); a Failed-under-Route vertex is terminal, not paused.
+func pauseFor[S any](r *vertexRun[S], out *stepOutcome[S]) (Interruption, bool) {
+	if _, routed := out.routable[r.vs.VertexID]; routed {
+		return Interruption{}, false
+	}
+	for _, iv := range out.pauses {
+		if iv.Vertex == r.vs.VertexID {
+			return iv, true
+		}
+	}
+	return Interruption{}, false
+}
+
+// awaitingRecord builds the durable InterruptRecord for a flow.Interrupt pause,
+// marshaling the user reason into Info and (for a StatefulInterrupt) the live
+// continuation into Continuation — the §10.1 serialization boundary. A failed
+// marshal yields a nil RawMessage (omitted on write); full continuation hardening
+// is Task 6.7.
+func awaitingRecord(v VertexID, sig *interruptSignal) InterruptRecord {
+	rec := InterruptRecord{Vertex: v, Kind: Awaiting, Info: marshalRaw(sig.info)}
+	if sig.stateful {
+		rec.Continuation = marshalRaw(sig.continuation)
+	}
+	return rec
+}
+
+// marshalRaw marshals v to a json.RawMessage, returning nil on a marshal error so
+// the field is omitted rather than poisoning the checkpoint (fail secure, §10.1).
+func marshalRaw(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// recoverReduce runs a reducer (or error-route record reducer) under panic recovery
+// (§12.5): a panic is converted to an error so clone-and-commit discards the clone
+// and the vertex follows its error policy rather than crashing the coordinator.
+func recoverReduce(f func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return f()
 }
 
 // routeHalt signals that routing produced a run-level halt (§9.8): a Condition
@@ -285,19 +484,25 @@ type routeHalt struct {
 	cause error
 }
 
-// finalizeStep performs §9.2.5–9.2.6 as ONE step boundary (the route+terminate
-// fold): it computes the routing decisions and the next deduped frontier
-// (§9.5/§9.6), sets c.frontier to it, then writes EXACTLY ONE boundary checkpoint
-// and decides the step's fate. It returns (result, done, err): done with a
-// non-nil result completes or halts the run; done false advances to the next
-// step. Outcomes (in order):
+// finalizeStep performs §9.2.5–9.2.6 as ONE step boundary. The route-or-pause
+// decision is mutually exclusive (§9.7/§9.8): if ANY vertex paused (Awaiting or
+// Errored-Pause) the step PAUSES — it does NOT route, Failed-Route handlers wait
+// for resume — via pauseStep, a terminal Result with Interrupts set and Halt nil.
+// Otherwise it routes (computeRoutes, INCLUDING Failed-Route handlers as
+// successors), sets c.frontier, writes EXACTLY ONE boundary checkpoint, and decides
+// the step's fate. It returns (result, done, err): done with a non-nil result
+// completes/halts/pauses the run; done false advances. Non-pause outcomes (in order):
 //   - routing halt (a Condition Pick errored/panicked or returned an
 //     empty/undeclared target) — HaltCondition/HaltUndeclaredTarget (§9.5/§9.8);
 //   - complete (frontier empty AND finish ran in some step) — §9.5;
 //   - dead end (frontier empty, finish never ran) — HaltDeadEnd (§9.5/§9.8);
 //   - advance (frontier non-empty) — append the StepRouted boundary and continue.
-func (c *coordinator[S]) finalizeStep(ctx context.Context, runs []*vertexRun[S]) (*Result[S], bool, error) {
-	routes, next, halt := c.computeRoutes(ctx, runs)
+func (c *coordinator[S]) finalizeStep(ctx context.Context, runs []*vertexRun[S], outcome *stepOutcome[S]) (*Result[S], bool, error) {
+	if outcome.paused() {
+		res, err := c.pauseStep(ctx, runs, outcome)
+		return res, true, err
+	}
+	routes, next, halt := c.computeRoutes(ctx, runs, outcome)
 	if halt != nil {
 		// Halt.Step here is the step that drained/failed routing (the routing/dead-end
 		// sense), not the step refused/not-started (the HaltMaxSteps sense, §9.5).
@@ -318,17 +523,58 @@ func (c *coordinator[S]) finalizeStep(ctx context.Context, runs []*vertexRun[S])
 	return c.advance(ctx, runs, routes, next)
 }
 
+// pauseStep ends the step as a per-vertex pause (§9.2.5, §9.7): with ≥1 paused
+// vertex the step never routes. It appends ONE StepPaused boundary checkpoint
+// carrying ALL InterruptRecords and re-including the paused vertices in the
+// frontier (so resume re-runs them, §9.3), stamps RunInterrupted/InterruptedAt,
+// and returns a terminal Result with Interrupts set and Halt nil (mutually
+// exclusive, §9.8). OnInterrupt already fired per-vertex in classifyStep.
+func (c *coordinator[S]) pauseStep(ctx context.Context, runs []*vertexRun[S], outcome *stepOutcome[S]) (*Result[S], error) {
+	c.rs.Status = RunInterrupted
+	c.rs.InterruptedAt = time.Now()
+	c.frontier = pausedVertices(outcome.pauses)
+
+	cp, err := c.checkpoint(StepPaused)
+	if err != nil {
+		return nil, err
+	}
+	cp.Frontier = c.frontier
+	cp.Vertices = vertexStates(runs)
+	cp.Interrupts = outcome.records
+	if err := c.append(ctx, cp); err != nil {
+		return nil, err
+	}
+	return &Result[S]{Run: c.rs, State: c.state, Interrupts: outcome.pauses}, nil
+}
+
+// pausedVertices returns the VertexID-sorted set of paused vertices from the
+// step's Interruptions, the frontier a StepPaused checkpoint resumes from (§10.1).
+func pausedVertices(pauses []Interruption) []VertexID {
+	set := newVertexSet()
+	for _, iv := range pauses {
+		set.addAll([]VertexID{iv.Vertex})
+	}
+	return set.ordered()
+}
+
 // computeRoutes derives, from the step's executed vertices (in VertexID order),
 // the routing decisions and the next deduped, VertexID-sorted frontier (§9.5
-// routing, §9.6 fan-in dedup). A vertex routes via its STATIC out-edges if it has
-// any (Conditional false), else via its Condition.Pick if it has one (Conditional
-// true, §7), else it is a sink (no successors). The FIRST routing halt in VertexID
-// order wins; on a halt it returns (nil, nil, halt). It mutates nothing.
-func (c *coordinator[S]) computeRoutes(ctx context.Context, runs []*vertexRun[S]) ([]RouteRecord, []VertexID, *routeHalt) {
+// routing, §9.6 fan-in dedup). A Done vertex routes via its STATIC out-edges if it
+// has any (Conditional false), else its Condition.Pick (Conditional true, §7), else
+// it is a sink. A Failed-under-Route vertex (in outcome.routable) routes to its
+// error-route handler (Conditional false, §12.2) — reached only when no vertex
+// paused, so handlers activate this step. The FIRST routing halt in VertexID order
+// wins; on a halt it returns (nil, nil, halt). It mutates nothing.
+func (c *coordinator[S]) computeRoutes(ctx context.Context, runs []*vertexRun[S], outcome *stepOutcome[S]) ([]RouteRecord, []VertexID, *routeHalt) {
 	var routes []RouteRecord
 	next := newVertexSet()
 	for _, r := range runs {
 		from := r.vs.VertexID
+		if handler, ok := outcome.routable[from]; ok {
+			routes = append(routes, RouteRecord{From: from, To: []VertexID{handler}, Conditional: false})
+			next.addAll([]VertexID{handler})
+			continue
+		}
 		if succ := c.graph.edges[from]; len(succ) > 0 {
 			routes = append(routes, RouteRecord{From: from, To: succ, Conditional: false})
 			next.addAll(succ)

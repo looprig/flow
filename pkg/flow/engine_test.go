@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -1254,12 +1255,13 @@ type rstate struct {
 	X   int
 }
 
-// TestReduceCloneAndCommitAtomic drives reduceStep DIRECTLY (white-box, package
+// TestReduceCloneAndCommitAtomic drives reduceSuccess DIRECTLY (white-box, package
 // flow) to pin §6.2: the coordinator clones the accumulator, applies the reducer
 // to the clone, and commits c.state only on a nil error. A reducer that MUTATES
 // *S (appends to Log, sets X) and THEN returns a non-nil error must leave the
 // committed c.state COMPLETELY UNCHANGED — the mutated clone is discarded, never
-// committed — and reduceStep must return that exact error.
+// committed — and reduceSuccess must return that exact error (which the
+// classify-and-reduce phase then folds into the vertex's error policy, §12.5).
 func TestReduceCloneAndCommitAtomic(t *testing.T) {
 	t.Parallel()
 
@@ -1339,12 +1341,12 @@ func TestReduceCloneAndCommitAtomic(t *testing.T) {
 				vs:  VertexState{VertexID: id, Status: VertexRunning},
 			}
 
-			gotErr := c.reduceStep(context.Background(), []*vertexRun[rstate]{run})
+			gotErr := c.reduceSuccess(run)
 
 			if tt.wantErr != nil {
 				// (a) the exact reducer error is surfaced.
 				if !errors.Is(gotErr, tt.wantErr) {
-					t.Fatalf("reduceStep error = %v, want %v", gotErr, tt.wantErr)
+					t.Fatalf("reduceSuccess error = %v, want %v", gotErr, tt.wantErr)
 				}
 				// (b) the committed state is COMPLETELY unchanged (clone discarded).
 				if !reflect.DeepEqual(c.state, snapshot) {
@@ -1355,7 +1357,7 @@ func TestReduceCloneAndCommitAtomic(t *testing.T) {
 
 			// Happy path: nil error and the state advanced to the reduced value.
 			if gotErr != nil {
-				t.Fatalf("reduceStep error = %v, want nil", gotErr)
+				t.Fatalf("reduceSuccess error = %v, want nil", gotErr)
 			}
 			if reflect.DeepEqual(c.state, snapshot) {
 				t.Errorf("c.state unchanged = %+v, want the reduced value committed", c.state)
@@ -1912,5 +1914,501 @@ func TestRunConditionalCycleHaltMaxSteps(t *testing.T) {
 	var mse *MaxStepsExceededError
 	if !errors.As(res.Halt.Cause, &mse) {
 		t.Fatalf("Halt.Cause = %v, want *MaxStepsExceededError", res.Halt.Cause)
+	}
+}
+
+// --- Task 6.6: per-vertex error policy + pause machinery (§12.2, §9.7) -------
+
+// failTask returns a task that fails the first `failTimes` calls with a fresh
+// error each call, then succeeds returning `ok`. A shared counter (atomic) makes
+// retry composition observable across attempts.
+func failTask(failTimes int, ok string, counter *int32) Task[int, string] {
+	return NewFuncTask(func(_ context.Context, _ int) (string, error) {
+		n := atomic.AddInt32(counter, 1)
+		if int(n) <= failTimes {
+			return "", fmt.Errorf("transient failure %d", n)
+		}
+		return ok, nil
+	})
+}
+
+// errRecorder is a concurrency-safe tally of OnInterrupt firings for assertion.
+type errRecorder struct {
+	mu         sync.Mutex
+	interrupts int
+	last       Interruption
+	all        []Interruption
+}
+
+func (er *errRecorder) hooks() Hooks {
+	return Hooks{
+		OnInterrupt: func(_ context.Context, iv Interruption) {
+			er.mu.Lock()
+			defer er.mu.Unlock()
+			er.interrupts++
+			er.last = iv
+			er.all = append(er.all, iv)
+		},
+	}
+}
+
+// addErrVertex binds a vertex whose task is supplied, with the standard cnt
+// selector/reducer, applying opts (WithRetry/WithErrorRoute/WithTimeout/...).
+func addErrVertex(t *testing.T, g *Graph[cnt], id VertexID, task Task[int, string], opts ...VertexOption[cnt]) {
+	t.Helper()
+	sel := func(s cnt) int { return s.N }
+	red := func(s *cnt, out string) error {
+		s.Vals = append(s.Vals, out)
+		s.N++
+		return nil
+	}
+	if err := AddVertex(g, id, task, sel, red, opts...); err != nil {
+		t.Fatalf("AddVertex(%v): %v", id, err)
+	}
+}
+
+// lastCheckpoint returns the latest appended checkpoint for a run.
+func lastCheckpoint(t *testing.T, store CheckpointStore, id GraphRunID) *Checkpoint {
+	t.Helper()
+	hist, err := store.History(context.Background(), id)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(hist) == 0 {
+		t.Fatal("no checkpoints")
+	}
+	return hist[len(hist)-1]
+}
+
+// TestRunRetryComposesSuccess proves WithRetry re-runs a transiently failing task
+// and the run completes once it succeeds, with Attempt reflecting the retries.
+func TestRunRetryComposesSuccess(t *testing.T) {
+	t.Parallel()
+
+	const k = 2 // fail twice, succeed on the 3rd attempt
+	var counter int32
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, failTask(k, "ok", &counter),
+		WithRetry[cnt](RetryPolicy{MaxAttempts: k + 1}))
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Errorf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+	if len(res.Interrupts) != 0 {
+		t.Errorf("Interrupts = %v, want none (retry succeeded)", res.Interrupts)
+	}
+	if res.State.N != 1 || len(res.State.Vals) != 1 || res.State.Vals[0] != "ok" {
+		t.Errorf("State = %+v, want one 'ok' fold", res.State)
+	}
+	last := lastCheckpoint(t, store, res.Run.GraphRunID)
+	if len(last.Vertices) != 1 || last.Vertices[0].Attempt != k+1 {
+		t.Errorf("Attempt = %d, want %d", last.Vertices[0].Attempt, k+1)
+	}
+}
+
+// TestRunRetryExhaustionRoute proves an always-failing task with WithRetry +
+// WithErrorRoute folds the error into S via the record reducer AND activates the
+// handler vertex next step; the run continues to completion.
+func TestRunRetryExhaustionRoute(t *testing.T) {
+	t.Parallel()
+
+	var counter int32
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry, handler := vID(1), vID(2)
+	// record reducer folds the error message into S so we can prove the fold ran.
+	record := func(s *cnt, e error) error {
+		s.Vals = append(s.Vals, "recorded:"+e.Error())
+		return nil
+	}
+	addErrVertex(t, g, entry, failTask(99, "never", &counter),
+		WithRetry[cnt](RetryPolicy{MaxAttempts: 2}),
+		WithErrorRoute[cnt](handler, record))
+	addErrVertex(t, g, handler, NewFuncTask(func(_ context.Context, _ int) (string, error) {
+		return "handled", nil
+	}))
+	r, err := g.Compile(entry, handler, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted (routed handler completes)", res.Run.Status)
+	}
+	if len(res.Interrupts) != 0 {
+		t.Errorf("Interrupts = %v, want none (routed, not paused)", res.Interrupts)
+	}
+	// The record reducer folded the error; the handler appended "handled".
+	foundRecorded, foundHandled := false, false
+	for _, v := range res.State.Vals {
+		if strings.HasPrefix(v, "recorded:") {
+			foundRecorded = true
+		}
+		if v == "handled" {
+			foundHandled = true
+		}
+	}
+	if !foundRecorded {
+		t.Errorf("State.Vals = %v, want a 'recorded:' fold from the record reducer", res.State.Vals)
+	}
+	if !foundHandled {
+		t.Errorf("State.Vals = %v, want 'handled' from the handler vertex", res.State.Vals)
+	}
+	// The failing vertex is recorded Failed and routes to the handler.
+	routes := routesFor(t, store, res.Run.GraphRunID)
+	foundRoute := false
+	for _, rec := range routes {
+		if rec.From == entry {
+			for _, to := range rec.To {
+				if to == handler {
+					foundRoute = true
+				}
+			}
+		}
+	}
+	if !foundRoute {
+		t.Errorf("routes = %+v, want entry -> handler error route", routes)
+	}
+	if atomic.LoadInt32(&counter) != 2 {
+		t.Errorf("task ran %d times, want 2 (MaxAttempts)", counter)
+	}
+}
+
+// TestRunRetryExhaustionPause proves an always-failing task with no error route
+// pauses as Errored: Result.Interrupts carries the *VertexError cause, the run is
+// RunInterrupted with no Halt, the last checkpoint is StepPaused with an Errored
+// record, OnInterrupt fired once, and it is NOT an engine error.
+func TestRunRetryExhaustionPause(t *testing.T) {
+	t.Parallel()
+
+	var counter int32
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, failTask(99, "never", &counter),
+		WithRetry[cnt](RetryPolicy{MaxAttempts: 3}))
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	er := &errRecorder{}
+	res, err := r.Run(context.Background(), cnt{}, WithHooks(er.hooks()))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil (pause is a Result, not an error)", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Errorf("Status = %v, want RunInterrupted", res.Run.Status)
+	}
+	if res.Halt != nil {
+		t.Errorf("Halt = %+v, want nil (mutually exclusive with Interrupts)", res.Halt)
+	}
+	if len(res.Interrupts) != 1 {
+		t.Fatalf("Interrupts = %v, want exactly 1", res.Interrupts)
+	}
+	iv := res.Interrupts[0]
+	if iv.Kind != Errored {
+		t.Errorf("Interruption.Kind = %v, want Errored", iv.Kind)
+	}
+	if iv.Vertex != entry {
+		t.Errorf("Interruption.Vertex = %v, want %v", iv.Vertex, entry)
+	}
+	var ve *VertexError
+	if !errors.As(iv.Cause, &ve) {
+		t.Fatalf("Interruption.Cause = %v, want *VertexError", iv.Cause)
+	}
+	if ve.Attempt != 3 {
+		t.Errorf("VertexError.Attempt = %d, want 3", ve.Attempt)
+	}
+	last := lastCheckpoint(t, store, res.Run.GraphRunID)
+	if last.Phase != StepPaused {
+		t.Errorf("last Phase = %v, want StepPaused", last.Phase)
+	}
+	if len(last.Interrupts) != 1 || last.Interrupts[0].Kind != Errored {
+		t.Errorf("last.Interrupts = %+v, want one Errored record", last.Interrupts)
+	}
+	if last.Interrupts[0].Cause == "" {
+		t.Error("Errored InterruptRecord.Cause is empty, want the error message")
+	}
+	if res.Run.InterruptedAt.IsZero() {
+		t.Error("InterruptedAt is zero on a paused run")
+	}
+	er.mu.Lock()
+	got := er.interrupts
+	er.mu.Unlock()
+	if got != 1 {
+		t.Errorf("OnInterrupt fired %d times, want 1", got)
+	}
+}
+
+// TestRunInterruptAwaitingPause proves flow.Interrupt pauses the vertex as
+// Awaiting: Result.Interrupts carries the user Info, StepPaused, OnInterrupt once,
+// NOT an engine error.
+func TestRunInterruptAwaitingPause(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, NewFuncTask(func(ctx context.Context, _ int) (string, error) {
+		return "", Interrupt(ctx, "need human approval")
+	}))
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	er := &errRecorder{}
+	res, err := r.Run(context.Background(), cnt{}, WithHooks(er.hooks()))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil (awaiting is a Result)", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Errorf("Status = %v, want RunInterrupted", res.Run.Status)
+	}
+	if len(res.Interrupts) != 1 {
+		t.Fatalf("Interrupts = %v, want exactly 1", res.Interrupts)
+	}
+	iv := res.Interrupts[0]
+	if iv.Kind != Awaiting {
+		t.Errorf("Kind = %v, want Awaiting", iv.Kind)
+	}
+	if got, ok := iv.Info.(string); !ok || got != "need human approval" {
+		t.Errorf("Info = %v, want 'need human approval'", iv.Info)
+	}
+	last := lastCheckpoint(t, store, res.Run.GraphRunID)
+	if last.Phase != StepPaused {
+		t.Errorf("last Phase = %v, want StepPaused", last.Phase)
+	}
+	if len(last.Interrupts) != 1 || last.Interrupts[0].Kind != Awaiting {
+		t.Errorf("last.Interrupts = %+v, want one Awaiting record", last.Interrupts)
+	}
+	// Awaiting record's Info is the marshaled reason.
+	var info string
+	if err := json.Unmarshal(last.Interrupts[0].Info, &info); err != nil || info != "need human approval" {
+		t.Errorf("InterruptRecord.Info = %s (err %v), want marshaled reason", last.Interrupts[0].Info, err)
+	}
+	er.mu.Lock()
+	got := er.interrupts
+	er.mu.Unlock()
+	if got != 1 {
+		t.Errorf("OnInterrupt fired %d times, want 1", got)
+	}
+}
+
+// TestRunTimeoutDeadline proves WithTimeout(d) wraps the task's ctx with a
+// per-vertex deadline SPANNING all retry attempts (§12.2): a task that observes
+// ctx.Done() and returns after expiry yields a *VertexError wrapping
+// context.DeadlineExceeded, which then follows the vertex's Pause policy. The
+// shared deadline already expired, so runWithRetry aborts the retry wait — the
+// spanning-deadline semantics — and the vertex pauses.
+func TestRunTimeoutDeadline(t *testing.T) {
+	t.Parallel()
+
+	var attempts int32
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, NewFuncTask(func(ctx context.Context, _ int) (string, error) {
+		atomic.AddInt32(&attempts, 1)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Second):
+			return "slept", nil
+		}
+	}),
+		WithTimeout[cnt](5*time.Millisecond),
+		WithRetry[cnt](RetryPolicy{MaxAttempts: 2}))
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Fatalf("Status = %v, want RunInterrupted (timeout exhausts retry then pauses)", res.Run.Status)
+	}
+	if len(res.Interrupts) != 1 {
+		t.Fatalf("Interrupts = %v, want 1", res.Interrupts)
+	}
+	var ve *VertexError
+	if !errors.As(res.Interrupts[0].Cause, &ve) {
+		t.Fatalf("Cause = %v, want *VertexError", res.Interrupts[0].Cause)
+	}
+	if !errors.Is(ve, context.DeadlineExceeded) {
+		t.Errorf("VertexError does not wrap context.DeadlineExceeded: %v", ve.Err)
+	}
+	if got := atomic.LoadInt32(&attempts); got < 1 {
+		t.Errorf("task ran %d times, want >= 1 (timed out on the first attempt)", got)
+	}
+}
+
+// TestRunTimeoutRetryable proves a context.DeadlineExceeded is RETRYABLE by the
+// default predicate (§12.2): a task that returns a DeadlineExceeded-wrapped error
+// on its first attempt then succeeds is retried and the run completes — the
+// deadline error is not treated as non-retryable. (A generous WithTimeout that
+// never fires keeps the spanning deadline from limiting the retry, isolating the
+// retryability of the error itself.)
+func TestRunTimeoutRetryable(t *testing.T) {
+	t.Parallel()
+
+	var attempts int32
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, NewFuncTask(func(_ context.Context, _ int) (string, error) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			return "", fmt.Errorf("simulated timeout: %w", context.DeadlineExceeded)
+		}
+		return "ok", nil
+	}),
+		WithTimeout[cnt](time.Minute), // generous: never fires, so it doesn't limit retry
+		WithRetry[cnt](RetryPolicy{MaxAttempts: 3}))
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Errorf("Status = %v, want RunCompleted (DeadlineExceeded is retryable, then succeeds)", res.Run.Status)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Errorf("task ran %d times, want 2 (retried after a retryable DeadlineExceeded)", got)
+	}
+}
+
+// TestRunRecordReducerFailurePauses proves a WithErrorRoute whose record reducer
+// itself errors pauses the vertex as Errored (no recursive route), leaving S
+// unchanged by the failed record reducer.
+func TestRunRecordReducerFailurePauses(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		record Reducer[cnt, error]
+	}{
+		{
+			name:   "record reducer errors",
+			record: func(_ *cnt, _ error) error { return errReduce },
+		},
+		{
+			name: "record reducer panics",
+			record: func(s *cnt, _ error) error {
+				s.Vals = append(s.Vals, "mutated-before-panic")
+				panic("record boom")
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var counter int32
+			store := NewMemStore()
+			g := NewGraph[cnt](GraphID{})
+			entry, handler := vID(1), vID(2)
+			addErrVertex(t, g, entry, failTask(99, "never", &counter),
+				WithErrorRoute[cnt](handler, tc.record))
+			addErrVertex(t, g, handler, NewFuncTask(func(_ context.Context, _ int) (string, error) {
+				return "handled", nil
+			}))
+			r, err := g.Compile(entry, handler, WithStore(store))
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+
+			res, err := r.Run(context.Background(), cnt{})
+			if err != nil {
+				t.Fatalf("Run returned engine error %v, want nil", err)
+			}
+			if res.Run.Status != RunInterrupted {
+				t.Fatalf("Status = %v, want RunInterrupted (record-reducer failure pauses)", res.Run.Status)
+			}
+			if len(res.Interrupts) != 1 || res.Interrupts[0].Kind != Errored {
+				t.Fatalf("Interrupts = %+v, want one Errored pause", res.Interrupts)
+			}
+			if res.Interrupts[0].Vertex != entry {
+				t.Errorf("paused vertex = %v, want %v (no recursive route)", res.Interrupts[0].Vertex, entry)
+			}
+			// The failed record reducer's clone is discarded: S is unchanged.
+			if len(res.State.Vals) != 0 {
+				t.Errorf("State.Vals = %v, want empty (failed record reducer's clone discarded)", res.State.Vals)
+			}
+			// The handler never ran (no recursive route).
+			for _, v := range res.State.Vals {
+				if v == "handled" {
+					t.Error("handler ran, want it NOT to run (record-reducer failure pauses, not routes)")
+				}
+			}
+		})
+	}
+}
+
+// TestRunSuccessReducerErrorPauses proves a vertex whose task SUCCEEDS but whose
+// normal reducer errors follows the error policy: with default Pause it pauses as
+// Errored and the clone is discarded (S unchanged).
+func TestRunSuccessReducerErrorPauses(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	sel := func(s cnt) int { return s.N }
+	// Task succeeds; reducer always errors.
+	badRed := func(s *cnt, _ string) error {
+		s.Vals = append(s.Vals, "mutated-then-err")
+		return errReduce
+	}
+	task := NewFuncTask(func(_ context.Context, _ int) (string, error) { return "ok", nil })
+	if err := AddVertex(g, entry, task, sel, badRed); err != nil {
+		t.Fatalf("AddVertex: %v", err)
+	}
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	er := &errRecorder{}
+	res, err := r.Run(context.Background(), cnt{}, WithHooks(er.hooks()))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil (reducer error follows error policy)", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Fatalf("Status = %v, want RunInterrupted (success-path reducer error pauses)", res.Run.Status)
+	}
+	if len(res.Interrupts) != 1 || res.Interrupts[0].Kind != Errored {
+		t.Fatalf("Interrupts = %+v, want one Errored pause", res.Interrupts)
+	}
+	if len(res.State.Vals) != 0 || res.State.N != 0 {
+		t.Errorf("State = %+v, want unchanged (clone discarded on reducer error)", res.State)
+	}
+	er.mu.Lock()
+	got := er.interrupts
+	er.mu.Unlock()
+	if got != 1 {
+		t.Errorf("OnInterrupt fired %d times, want 1", got)
 	}
 }
