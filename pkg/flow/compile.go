@@ -28,38 +28,6 @@ package flow
 // concurrency, maxSteps, granularity options and Run/Resume/Status are later
 // phases.
 
-// Runner is the immutable, validated form of a Graph[S], produced by Compile
-// (§8, §9). It is safe to reuse across concurrent runs. Today it holds the
-// validated graph, the entry/finish roles, the GraphVersion fingerprint (§8.1),
-// and the single CheckpointStore set at Compile (§9); later phases extend it with
-// hooks, concurrency, maxSteps, and granularity needed to actually Run (§9). Its
-// only methods are the §8.1 accessors (GraphID/GraphVersion); execution and the
-// rest of the control surface are later phases.
-//
-// The store is the INTERFACE (CheckpointStore), not a concrete type (dependency
-// inversion): the default MemStore is wired at Compile, the composition point, so
-// the Runner never depends on a specific backend. Per §9 it is fixed at Compile —
-// ALL operations (Run, Resume, Status, Get) use this one store; there is no
-// per-run override.
-type Runner[S any] struct {
-	graph   *Graph[S]
-	entry   VertexID
-	finish  VertexID
-	version string          // GraphVersion fingerprint (§8.1), computed at Compile
-	store   CheckpointStore // the single durable store for all ops (§9)
-}
-
-// GraphID returns the runner's stable definition identity (§3, §8.1): the pinned
-// GraphID of the compiled graph. It is identity, NOT the compatibility key — use
-// GraphVersion for resume compatibility.
-func (r *Runner[S]) GraphID() GraphID { return r.graph.id }
-
-// GraphVersion returns the compatibility fingerprint computed at Compile (§8.1):
-// a sha256 of the graph's topology plus a ":userVersion" suffix. Resume compares
-// it to the checkpoint's; any difference is a GraphVersionMismatchError, so a
-// changed graph cannot resume an old checkpoint.
-func (r *Runner[S]) GraphVersion() string { return r.version }
-
 // compileConfig is the resolved Compile-time configuration assembled from
 // CompileOptions (§8). store holds the optional caller-supplied CheckpointStore;
 // a nil store (option unset, or WithStore(nil)) means "use the default MemStore",
