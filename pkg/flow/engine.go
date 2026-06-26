@@ -141,12 +141,17 @@ func (c *coordinator[S]) seed(ctx context.Context) error {
 // runStep performs §9.2.2–9.2.3: freeze the committed state as the step base
 // (marshaled into stepBaseJSON, the frozen S_N every checkpoint in this step
 // carries), derive each frontier vertex's input via its selector (in VertexID
-// order for determinism), then run every vertex in parallel behind a barrier. It
-// stamps StartedAt and fires OnVertexStart on the COORDINATOR goroutine before
-// launch, so the hook observes a non-zero StartedAt and the field is written
-// race-free (the vertex goroutine writes only out/Attempt, read after the
-// barrier). On the happy path every result has a nil error. A goroutine-per-
-// vertex with a WaitGroup is sufficient here; the concurrency BOUND is later.
+// order for determinism), then run the frontier in parallel behind a barrier,
+// BOUNDED to c.cfg.concurrency concurrent vertices (§9.2.3, default GOMAXPROCS).
+//
+// A counting semaphore (a buffered channel sized to the bound) throttles launch:
+// the COORDINATOR goroutine acquires a slot before stamping StartedAt, firing
+// OnVertexStart, and launching, so (a) at most `concurrency` vertices run at
+// once, (b) StartedAt/OnVertexStart stay on the coordinator goroutine — race-free
+// and reflecting when the vertex actually got a slot — and (c) each worker
+// releases its slot on completion. The WaitGroup is still the barrier: reduce
+// does not begin until every vertex has finished. On the happy path every result
+// has a nil error.
 func (c *coordinator[S]) runStep(ctx context.Context) ([]*vertexRun[S], error) {
 	stepBase := c.state
 	baseJSON, err := json.Marshal(stepBase)
@@ -158,14 +163,21 @@ func (c *coordinator[S]) runStep(ctx context.Context) ([]*vertexRun[S], error) {
 	if err != nil {
 		return nil, err
 	}
+	bound := c.cfg.concurrency
+	if bound < 1 {
+		bound = 1 // defensive clamp: a buffered channel needs a positive size
+	}
+	sem := make(chan struct{}, bound)
 	var wg sync.WaitGroup
 	for _, r := range runs {
 		r := r
+		sem <- struct{}{} // acquire a slot; the coordinator blocks here at the bound
 		r.vs.StartedAt = time.Now()
 		c.cfg.hooks.onVertexStart(ctx, r.vs)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() { <-sem }() // release the slot on completion
 			c.execVertex(ctx, r)
 		}()
 	}

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // This file white-box tests the BSP coordinator's super-step loop (§9.2): seed →
@@ -854,5 +856,381 @@ func TestRunFinishWithOutEdgeCompletes(t *testing.T) {
 	// entry, fin, sink each ran once.
 	if res.State.N != 3 {
 		t.Errorf("State.N = %d, want 3 (entry + fin + sink)", res.State.N)
+	}
+}
+
+// --- Task 6.3: bounded parallelism within a super-step + snapshot safety ------
+
+// pstate is a parallel-fan-out accumulator whose StepBase carries REFERENCE
+// fields (a shared map, slice, and pointer) so the snapshot-safety tests can
+// prove the frozen base every sibling selector reads is stable while reducers
+// commit into DISJOINT keys on the coordinator goroutine. It round-trips through
+// the JSON codec (exported fields) so clone-and-commit works.
+type pstate struct {
+	Seen    map[string]int // disjoint per-vertex contributions (Seen[itsID])
+	Log     []string       // append-only order/threading log
+	Counter *int           // a shared pointer reference field the selectors read
+}
+
+// gate coordinates the concurrency-bound test: each parallel task increments a
+// live counter on entry (tracking the running maximum), blocks until released so
+// siblings overlap, then decrements on exit. release is closed once to let the
+// whole frontier proceed, so the observed maximum reflects the launch bound.
+type gate struct {
+	live    atomic.Int32
+	max     atomic.Int32
+	release chan struct{}
+}
+
+func newGate() *gate { return &gate{release: make(chan struct{})} }
+
+// enter records a task starting: bump live, lift max to the new high-water mark,
+// then block on release so overlapping tasks pile up against the bound.
+func (g *gate) enter() {
+	n := g.live.Add(1)
+	for {
+		m := g.max.Load()
+		if n <= m || g.max.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	<-g.release
+}
+
+func (g *gate) leave() { g.live.Add(-1) }
+func (g *gate) open()  { close(g.release) }
+
+// addParallelVertex binds a fan-out worker that, on entry, records concurrency
+// via gate (if non-nil), appends its id under Seen[id] (a DISJOINT field), and
+// returns its id as output. The selector reads the shared Counter reference from
+// the frozen base; the reducer writes only this vertex's own Seen key, so sibling
+// reducers never touch the same field (single-writer coordinator, §9.4).
+func addParallelVertex(t *testing.T, g *Graph[pstate], id VertexID, key string, gt *gate) {
+	t.Helper()
+	task := NewFuncTask(func(_ context.Context, _ int) (string, error) {
+		if gt != nil {
+			gt.enter()
+			defer gt.leave()
+		}
+		return key, nil
+	})
+	// selector reads the shared Counter pointer from the frozen base (read-only).
+	sel := func(s pstate) int {
+		if s.Counter != nil {
+			return *s.Counter
+		}
+		return 0
+	}
+	red := func(s *pstate, out string) error {
+		if s.Seen == nil {
+			s.Seen = map[string]int{}
+		}
+		s.Seen[out]++ // DISJOINT: each vertex owns its own key
+		return nil
+	}
+	if err := AddVertex(g, id, task, sel, red); err != nil {
+		t.Fatalf("AddVertex(%v): %v", id, err)
+	}
+}
+
+// compileFanOut builds entry -> w_1..w_n -> join -> finish over pstate: entry
+// fans out to n workers in the SAME super-step, the workers fan in to join, and
+// join routes to finish. Each worker is wired with the shared gate. It returns
+// the Runner and the worker keys for assertion.
+func compileFanOut(t *testing.T, store CheckpointStore, n int, gt *gate) (*Runner[pstate], []string) {
+	t.Helper()
+	g := NewGraph[pstate](GraphID{})
+	entry, join, finish := vID(1), vID(byte(n+2)), vID(byte(n+3))
+	addParallelVertex(t, g, entry, "entry", nil)
+	keys := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		wid := vID(byte(i + 2))
+		key := workerKey(i)
+		keys = append(keys, key)
+		addParallelVertex(t, g, wid, key, gt)
+		if err := g.AddEdge(entry, wid); err != nil {
+			t.Fatalf("AddEdge(entry->%v): %v", wid, err)
+		}
+		if err := g.AddEdge(wid, join); err != nil {
+			t.Fatalf("AddEdge(%v->join): %v", wid, err)
+		}
+	}
+	addParallelVertex(t, g, join, "join", nil)
+	addParallelVertex(t, g, finish, "finish", nil)
+	if err := g.AddEdge(join, finish); err != nil {
+		t.Fatalf("AddEdge(join->finish): %v", err)
+	}
+	r, err := g.Compile(entry, finish, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	return r, keys
+}
+
+// workerKey is the stable per-worker Seen key.
+func workerKey(i int) string { return "w" + string(rune('A'+i)) }
+
+// seedState returns a pstate whose reference fields are populated so selectors
+// reading the frozen base observe non-nil shared data.
+func seedState() pstate {
+	zero := 0
+	return pstate{Seen: map[string]int{}, Log: nil, Counter: &zero}
+}
+
+// TestRunParallelRaceClean proves a wide fan-out step runs race-clean under -race:
+// N=8 workers run concurrently (their selectors read a SHARED reference field from
+// the frozen base while their reducers write DISJOINT Seen keys), and the merged
+// state after the join carries all N contributions exactly once.
+func TestRunParallelRaceClean(t *testing.T) {
+	t.Parallel()
+
+	const n = 8
+	store := NewMemStore()
+	gt := newGate()
+	gt.open() // no throttling needed; just let everyone run
+	r, keys := compileFanOut(t, store, n, gt)
+
+	res, err := r.Run(context.Background(), seedState())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+	for _, k := range keys {
+		if res.State.Seen[k] != 1 {
+			t.Errorf("Seen[%q] = %d, want 1 (each worker reduced exactly once)", k, res.State.Seen[k])
+		}
+	}
+	if got := len(res.State.Seen); got < n {
+		t.Errorf("len(Seen) = %d, want >= %d (all worker contributions merged)", got, n)
+	}
+}
+
+// TestRunConcurrencyBound proves WithConcurrency(k) caps the number of vertices
+// running at once: with a fan-out of N > k workers that block until released, the
+// observed running maximum never exceeds k. k=1 serializes (max == 1); k=2 admits
+// real parallelism (max > 1 when N >= 2) yet stays <= 2.
+func TestRunConcurrencyBound(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		k       int
+		n       int
+		wantMax int32 // exact expected high-water mark of concurrently running tasks
+	}{
+		{name: "serialized k=1", k: 1, n: 4, wantMax: 1},
+		{name: "bounded k=2", k: 2, n: 4, wantMax: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gt := newGate()
+			r, _ := compileFanOut(t, NewMemStore(), tt.n, gt)
+
+			// Once k tasks are blocked at the gate (the bound is saturated), no more
+			// can launch, so release to let the run drain. Poll the live count.
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				deadline := time.Now().Add(2 * time.Second)
+				for time.Now().Before(deadline) {
+					if gt.live.Load() >= int32(tt.k) {
+						break
+					}
+					time.Sleep(time.Millisecond)
+				}
+				gt.open()
+			}()
+
+			res, err := r.Run(context.Background(), seedState(), WithConcurrency(tt.k))
+			<-done
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res.Run.Status != RunCompleted {
+				t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+			}
+			got := gt.max.Load()
+			if got > int32(tt.k) {
+				t.Errorf("observed max concurrency = %d, want <= %d (WithConcurrency bound)", got, tt.k)
+			}
+			if got != tt.wantMax {
+				t.Errorf("observed max concurrency = %d, want exactly %d", got, tt.wantMax)
+			}
+		})
+	}
+}
+
+// TestRunStepBaseImmutable proves the frozen StepBase a sibling selector reads is
+// the immutable snapshot, unaffected by another vertex's reducer mutating S. A
+// 2-worker step runs; vertex A's reducer appends to the merged state while vertex
+// B's selector reads the SAME frozen base (the pre-step Counter), so B observes
+// stable data. The committed StepBase the NEXT step reads is the clone-committed
+// value, NOT a mutated alias.
+func TestRunStepBaseImmutable(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	g := NewGraph[pstate](GraphID{})
+	entry, a, b, join := vID(1), vID(2), vID(3), vID(4)
+	addParallelVertex(t, g, entry, "entry", nil)
+
+	// Both A and B read the frozen base's Counter via their selectors and record
+	// what they observed; A's reducer ALSO appends to Log. Because selectors run on
+	// the coordinator against the frozen base BEFORE any launch/reduce, both must
+	// observe the same pre-step Counter (7), regardless of A's later mutation.
+	var aObserved, bObserved atomic.Int32
+	mkWorker := func(id VertexID, observed *atomic.Int32, mutates bool) {
+		task := NewFuncTask(func(_ context.Context, in int) (int, error) {
+			observed.Store(int32(in))
+			return in, nil
+		})
+		sel := func(s pstate) int {
+			if s.Counter != nil {
+				return *s.Counter
+			}
+			return -1
+		}
+		red := func(s *pstate, out int) error {
+			if mutates {
+				s.Log = append(s.Log, "A-mutated")
+			}
+			return nil
+		}
+		if err := AddVertex(g, id, task, sel, red); err != nil {
+			t.Fatalf("AddVertex(%v): %v", id, err)
+		}
+	}
+	mkWorker(a, &aObserved, true)
+	mkWorker(b, &bObserved, false)
+	addParallelVertex(t, g, join, "join", nil)
+	for _, e := range [][2]VertexID{{entry, a}, {entry, b}, {a, join}, {b, join}} {
+		if err := g.AddEdge(e[0], e[1]); err != nil {
+			t.Fatalf("AddEdge(%v->%v): %v", e[0], e[1], err)
+		}
+	}
+	r, err := g.Compile(entry, join, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	seven := 7
+	res, err := r.Run(context.Background(), pstate{Seen: map[string]int{}, Counter: &seven})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+	// Both siblings read the SAME frozen base Counter (7); A's reducer mutation of
+	// Log did not perturb the base B's selector read.
+	if aObserved.Load() != 7 {
+		t.Errorf("A observed base Counter = %d, want 7", aObserved.Load())
+	}
+	if bObserved.Load() != 7 {
+		t.Errorf("B observed base Counter = %d, want 7 (frozen base unchanged by A's reducer)", bObserved.Load())
+	}
+	// The committed state carries A's single append (single-writer reduce).
+	got := 0
+	for _, v := range res.State.Log {
+		if v == "A-mutated" {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Errorf("Log has %d 'A-mutated' entries, want 1 (clone-and-commit, no aliasing)", got)
+	}
+}
+
+// TestRunBarrierWaitsAll proves the WaitGroup barrier holds reduce/route until
+// EVERY frontier vertex finished: one slow worker delays the barrier, and the
+// reducer for any worker must not run until all workers completed their task. A
+// shared ordered log records each task's completion and each reducer's start; the
+// first reducer must appear only after all N task completions.
+func TestRunBarrierWaitsAll(t *testing.T) {
+	t.Parallel()
+
+	const n = 4
+	store := NewMemStore()
+	g := NewGraph[pstate](GraphID{})
+	entry, join := vID(1), vID(byte(n+2))
+
+	var mu sync.Mutex
+	var log []string
+	record := func(s string) {
+		mu.Lock()
+		log = append(log, s)
+		mu.Unlock()
+	}
+	addParallelVertex(t, g, entry, "entry", nil)
+	for i := 0; i < n; i++ {
+		wid := vID(byte(i + 2))
+		key := workerKey(i)
+		slow := i == 0 // the first worker is the straggler
+		task := NewFuncTask(func(_ context.Context, _ int) (string, error) {
+			if slow {
+				time.Sleep(20 * time.Millisecond)
+			}
+			record("task-done:" + key)
+			return key, nil
+		})
+		sel := func(s pstate) int { return 0 }
+		red := func(s *pstate, out string) error {
+			record("reduce:" + out)
+			if s.Seen == nil {
+				s.Seen = map[string]int{}
+			}
+			s.Seen[out]++
+			return nil
+		}
+		if err := AddVertex(g, wid, task, sel, red); err != nil {
+			t.Fatalf("AddVertex(%v): %v", wid, err)
+		}
+		if err := g.AddEdge(entry, wid); err != nil {
+			t.Fatalf("AddEdge(entry->%v): %v", wid, err)
+		}
+		if err := g.AddEdge(wid, join); err != nil {
+			t.Fatalf("AddEdge(%v->join): %v", wid, err)
+		}
+	}
+	addParallelVertex(t, g, join, "join", nil)
+	r, err := g.Compile(entry, join, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	// concurrency >= n so the barrier (not the bound) is what serializes task->reduce.
+	res, err := r.Run(context.Background(), seedState(), WithConcurrency(n))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Find the index of the first reducer start; all N task completions must precede it.
+	firstReduce := -1
+	for i, e := range log {
+		if len(e) >= 7 && e[:7] == "reduce:" {
+			firstReduce = i
+			break
+		}
+	}
+	if firstReduce == -1 {
+		t.Fatalf("no reducer ran; log = %v", log)
+	}
+	taskDone := 0
+	for _, e := range log[:firstReduce] {
+		if len(e) >= 10 && e[:10] == "task-done:" {
+			taskDone++
+		}
+	}
+	if taskDone != n {
+		t.Errorf("only %d/%d worker tasks completed before the first reducer ran (barrier did not wait for all)", taskDone, n)
 	}
 }
