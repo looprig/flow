@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ciram-co/flow/pkg/uuid"
 )
 
 // This file white-box tests the BSP coordinator's super-step loop (§9.2): seed →
@@ -1232,5 +1235,302 @@ func TestRunBarrierWaitsAll(t *testing.T) {
 	}
 	if taskDone != n {
 		t.Errorf("only %d/%d worker tasks completed before the first reducer ran (barrier did not wait for all)", taskDone, n)
+	}
+}
+
+// --- Task 6.4: reduce semantics — clone-and-commit atomicity + same-field order
+
+// rstate is a reduce-semantics accumulator with a REFERENCE field (Log, a slice)
+// alongside a scalar (X), so the clone-and-commit atomicity test can prove a
+// reducer that mutates the slice/scalar then errors leaves the committed S byte-
+// for-byte unchanged (the mutated clone is discarded, §6.2). It round-trips
+// through the JSON codec (exported fields) so clone() works.
+type rstate struct {
+	Log []string
+	X   int
+}
+
+// TestReduceCloneAndCommitAtomic drives reduceStep DIRECTLY (white-box, package
+// flow) to pin §6.2: the coordinator clones the accumulator, applies the reducer
+// to the clone, and commits c.state only on a nil error. A reducer that MUTATES
+// *S (appends to Log, sets X) and THEN returns a non-nil error must leave the
+// committed c.state COMPLETELY UNCHANGED — the mutated clone is discarded, never
+// committed — and reduceStep must return that exact error.
+func TestReduceCloneAndCommitAtomic(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		start   rstate
+		reduce  func(s *rstate, out int) error
+		out     int
+		wantErr error
+	}{
+		{
+			name:  "mutate-then-error leaves committed state unchanged",
+			start: rstate{Log: []string{"committed"}, X: 41},
+			reduce: func(s *rstate, out int) error {
+				s.Log = append(s.Log, "mutated") // mutate the clone
+				s.X = out                        // mutate the clone
+				return errReduce                 // ... then reject the fold
+			},
+			out:     999,
+			wantErr: errReduce,
+		},
+		{
+			name:  "empty committed state, mutate-then-error stays empty",
+			start: rstate{},
+			reduce: func(s *rstate, out int) error {
+				s.Log = append(s.Log, "x")
+				s.X = 7
+				return errReduce
+			},
+			out:     7,
+			wantErr: errReduce,
+		},
+		{
+			name:  "happy path commits (nil error advances state)",
+			start: rstate{Log: []string{"a"}, X: 1},
+			reduce: func(s *rstate, out int) error {
+				s.Log = append(s.Log, "b")
+				s.X = out
+				return nil
+			},
+			out:     2,
+			wantErr: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Build a real erased vertex via AddVertex so applyReducer is the
+			// production seam, then construct the vertexRun and coordinator directly
+			// (this is package flow, so the unexported fields are reachable).
+			g := NewGraph[rstate](GraphID{})
+			id := vID(1)
+			task := NewFuncTask(func(_ context.Context, in int) (int, error) { return in, nil })
+			sel := func(s rstate) int { return s.X }
+			if err := AddVertex(g, id, task, sel, tt.reduce); err != nil {
+				t.Fatalf("AddVertex: %v", err)
+			}
+
+			c := &coordinator[rstate]{
+				graph:  g,
+				finish: vID(99), // not this vertex: the finishRan latch must not interfere
+				store:  NewMemStore(),
+				cfg:    defaultRunConfig(),
+				state:  tt.start,
+			}
+			// A deep, independent snapshot of the committed state taken BEFORE the
+			// call: reflect.DeepEqual against it proves nothing leaked from the clone.
+			snapshot, err := clone(c.state)
+			if err != nil {
+				t.Fatalf("snapshot clone: %v", err)
+			}
+
+			run := &vertexRun[rstate]{
+				v:   g.vertices[id],
+				out: tt.out,
+				vs:  VertexState{VertexID: id, Status: VertexRunning},
+			}
+
+			gotErr := c.reduceStep(context.Background(), []*vertexRun[rstate]{run})
+
+			if tt.wantErr != nil {
+				// (a) the exact reducer error is surfaced.
+				if !errors.Is(gotErr, tt.wantErr) {
+					t.Fatalf("reduceStep error = %v, want %v", gotErr, tt.wantErr)
+				}
+				// (b) the committed state is COMPLETELY unchanged (clone discarded).
+				if !reflect.DeepEqual(c.state, snapshot) {
+					t.Errorf("c.state = %+v, want %+v (mutated clone must be discarded, §6.2)", c.state, snapshot)
+				}
+				return
+			}
+
+			// Happy path: nil error and the state advanced to the reduced value.
+			if gotErr != nil {
+				t.Fatalf("reduceStep error = %v, want nil", gotErr)
+			}
+			if reflect.DeepEqual(c.state, snapshot) {
+				t.Errorf("c.state unchanged = %+v, want the reduced value committed", c.state)
+			}
+			if c.state.X != tt.out {
+				t.Errorf("c.state.X = %d, want %d (committed on nil error)", c.state.X, tt.out)
+			}
+		})
+	}
+}
+
+// winState records which fan-out vertex last wrote the shared Winner field plus
+// an ordered Order log, both reference/scalar fields that round-trip through JSON.
+type winState struct {
+	Winner string
+	A      string
+	B      string
+	Order  []string
+}
+
+// pinnedFanOut wires entry -> {lo, hi} (a single super-step fan-out) -> finish
+// over winState, with lo's and hi's VertexIDs PINNED so loID < hiID lexically
+// (uuid.MustParse). Each of lo/hi runs the given reducer in the SAME step; both
+// route to finish. It returns the Runner, the store, and (loID, hiID) so a test
+// can assert which VertexID's write survived. entry and finish are inert (their
+// reducers are no-ops) so only lo/hi touch the asserted fields.
+func pinnedFanOut(
+	t *testing.T, store CheckpointStore,
+	loReduce, hiReduce func(s *winState, out string) error,
+) (*Runner[winState], VertexID, VertexID) {
+	t.Helper()
+	g := NewGraph[winState](GraphID{})
+
+	// Pinned so loID < hiID as canonical strings (00...01 < 00...02), giving a
+	// KNOWN, run-stable VertexID order the reduce loop iterates in (§9.4).
+	entry := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000010"))
+	loID := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000001"))
+	hiID := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000002"))
+	finish := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000020"))
+	if loID.String() >= hiID.String() {
+		t.Fatalf("pinned ids not ordered: lo=%s hi=%s", loID, hiID)
+	}
+
+	noop := func(s *winState, _ string) error { return nil }
+	task := NewFuncTask(func(_ context.Context, _ int) (string, error) { return "out", nil })
+	sel := func(s winState) int { return 0 }
+
+	add := func(id VertexID, red func(s *winState, out string) error) {
+		if err := AddVertex(g, id, task, sel, red); err != nil {
+			t.Fatalf("AddVertex(%v): %v", id, err)
+		}
+	}
+	add(entry, noop)
+	add(loID, loReduce)
+	add(hiID, hiReduce)
+	add(finish, noop)
+
+	for _, e := range [][2]VertexID{{entry, loID}, {entry, hiID}, {loID, finish}, {hiID, finish}} {
+		if err := g.AddEdge(e[0], e[1]); err != nil {
+			t.Fatalf("AddEdge(%v->%v): %v", e[0], e[1], err)
+		}
+	}
+	r, err := g.Compile(entry, finish, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	return r, loID, hiID
+}
+
+// TestReduceSameFieldLastInVertexIDOrderWins proves §9.4: two vertices in the
+// SAME super-step that reduce into the SAME field are applied single-threaded in
+// VertexID order, so the HIGHER VertexID (last in order) wins — a defined,
+// run-stable overwrite, NOT a race. lo writes Winner="lo", hi writes Winner="hi";
+// since loID < hiID, the committed Winner must be "hi". Running under -race and
+// -count proves the outcome is deterministic, not racy.
+func TestReduceSameFieldLastInVertexIDOrderWins(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	loReduce := func(s *winState, _ string) error { s.Winner = "lo"; return nil }
+	hiReduce := func(s *winState, _ string) error { s.Winner = "hi"; return nil }
+	r, loID, hiID := pinnedFanOut(t, store, loReduce, hiReduce)
+
+	res, err := r.Run(context.Background(), winState{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+	// hi has the higher VertexID, so it reduces LAST and its write survives.
+	if res.State.Winner != "hi" {
+		t.Errorf("Winner = %q, want %q (higher VertexID %s reduces last, beating %s, §9.4)",
+			res.State.Winner, "hi", hiID, loID)
+	}
+}
+
+// TestReduceDisjointFieldsAllApply proves a same-step fan-out whose two reducers
+// write DISJOINT fields both land in the committed state (single-writer reduce,
+// no lost update). lo writes A, hi writes B; the final state carries both.
+// Race-clean under -race.
+func TestReduceDisjointFieldsAllApply(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	loReduce := func(s *winState, _ string) error { s.A = "from-lo"; return nil }
+	hiReduce := func(s *winState, _ string) error { s.B = "from-hi"; return nil }
+	r, _, _ := pinnedFanOut(t, store, loReduce, hiReduce)
+
+	res, err := r.Run(context.Background(), winState{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+	if res.State.A != "from-lo" {
+		t.Errorf("State.A = %q, want %q (lo's disjoint contribution)", res.State.A, "from-lo")
+	}
+	if res.State.B != "from-hi" {
+		t.Errorf("State.B = %q, want %q (hi's disjoint contribution)", res.State.B, "from-hi")
+	}
+}
+
+// TestReduceOrderIsVertexIDStable proves the reduce loop applies reducers in
+// VertexID-sorted order deterministically: a 3-vertex fan-out where each reducer
+// appends its own pinned VertexID string to Order must yield Order ==
+// [lowest, middle, highest] every run. Pinned ids give a known target order;
+// -count proves it is stable, not incidental.
+func TestReduceOrderIsVertexIDStable(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	g := NewGraph[winState](GraphID{})
+
+	entry := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000010"))
+	lo := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000001"))
+	mid := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000002"))
+	hi := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000003"))
+	finish := VertexID(uuid.MustParse("00000000-0000-4000-8000-000000000020"))
+
+	task := NewFuncTask(func(_ context.Context, _ int) (string, error) { return "out", nil })
+	sel := func(s winState) int { return 0 }
+	noop := func(s *winState, _ string) error { return nil }
+	// Each fan-out reducer appends its own id; the coordinator reduces them
+	// single-threaded in VertexID order, so Order reflects that sort.
+	mkAppend := func(id VertexID) func(s *winState, out string) error {
+		return func(s *winState, _ string) error { s.Order = append(s.Order, id.String()); return nil }
+	}
+	add := func(id VertexID, red func(s *winState, out string) error) {
+		if err := AddVertex(g, id, task, sel, red); err != nil {
+			t.Fatalf("AddVertex(%v): %v", id, err)
+		}
+	}
+	add(entry, noop)
+	add(lo, mkAppend(lo))
+	add(mid, mkAppend(mid))
+	add(hi, mkAppend(hi))
+	add(finish, noop)
+	for _, e := range [][2]VertexID{
+		{entry, lo}, {entry, mid}, {entry, hi},
+		{lo, finish}, {mid, finish}, {hi, finish},
+	} {
+		if err := g.AddEdge(e[0], e[1]); err != nil {
+			t.Fatalf("AddEdge(%v->%v): %v", e[0], e[1], err)
+		}
+	}
+	r, err := g.Compile(entry, finish, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), winState{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := sortFrontier([]VertexID{lo, mid, hi})
+	wantOrder := []string{want[0].String(), want[1].String(), want[2].String()}
+	if !reflect.DeepEqual(res.State.Order, wantOrder) {
+		t.Errorf("reduce Order = %v, want %v (VertexID-sorted, §9.4)", res.State.Order, wantOrder)
 	}
 }
