@@ -2727,3 +2727,258 @@ func TestRunStatefulInterruptUnserializableContinuationErrors(t *testing.T) {
 		t.Fatalf("Run error = %v, want a *codecError (fail-secure marshal failure)", err)
 	}
 }
+
+// --- Task 6.8: checkpoint granularity (PerVertex vs PerStep) (§10.1) ----------
+
+// countPhase counts the checkpoints in a run's history matching phase, so a
+// granularity test can assert the exact number of per-vertex StepRunning writes
+// (or any other phase) the coordinator durably appended (§10.1).
+func countPhase(t *testing.T, store CheckpointStore, id GraphRunID, phase StepPhase) int {
+	t.Helper()
+	hist, err := store.History(context.Background(), id)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	n := 0
+	for _, cp := range hist {
+		if cp.Phase == phase {
+			n++
+		}
+	}
+	return n
+}
+
+// compileGranularityFanOut wires v -> {a, b} -> fin over cnt and compiles it,
+// returning the Runner. Step 1's frontier is {a, b}, so a PerVertex run appends
+// exactly two StepRunning checkpoints (one per terminal vertex), the cadence the
+// granularity tests measure (§10.1).
+func compileGranularityFanOut(t *testing.T, store CheckpointStore) *Runner[cnt] {
+	t.Helper()
+	g := NewGraph[cnt](GraphID{})
+	v, a, b, fin := vID(1), vID(2), vID(3), vID(4)
+	tagVertex(t, g, v, "v")
+	tagVertex(t, g, a, "a")
+	tagVertex(t, g, b, "b")
+	tagVertex(t, g, fin, "fin")
+	for _, e := range [][2]VertexID{{v, a}, {v, b}, {a, fin}, {b, fin}} {
+		if err := g.AddEdge(e[0], e[1]); err != nil {
+			t.Fatalf("AddEdge(%v->%v): %v", e[0], e[1], err)
+		}
+	}
+	r, err := g.Compile(v, fin, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	return r
+}
+
+// TestRunPerVertexCheckpoints proves the default PerVertex cadence appends one
+// StepRunning checkpoint per terminal vertex (§10.1): the fan-out step 1 runs
+// both a and b, so the run's History holds exactly two StepRunning checkpoints
+// (one per vertex), plus seed step 0 (entry v alone) and finish step 2 (the
+// merged fan-in) each contributing one more, for four StepRunning in total.
+func TestRunPerVertexCheckpoints(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	r := compileGranularityFanOut(t, store)
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+
+	// Step 0: v (1). Step 1: a, b (2). Step 2: fin (1). Total per-vertex = 4.
+	if got := countPhase(t, store, res.Run.GraphRunID, StepRunning); got != 4 {
+		t.Errorf("StepRunning count = %d, want 4 (one per terminal vertex across all steps)", got)
+	}
+}
+
+// TestRunPerStepNoStepRunning proves PerStep appends ZERO per-vertex StepRunning
+// checkpoints (§10.1): the SAME fan-out graph run with WithCheckpointEvery(PerStep)
+// writes only the seed and the StepRouted step boundaries, so a crash re-runs the
+// whole frontier from StepBase. Latest mid-run (the last appended checkpoint) sits
+// on a step boundary, never a per-vertex record.
+func TestRunPerStepNoStepRunning(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	r := compileGranularityFanOut(t, store)
+
+	res, err := r.Run(context.Background(), cnt{}, WithCheckpointEvery(PerStep))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Run.Status != RunCompleted {
+		t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+	}
+
+	if got := countPhase(t, store, res.Run.GraphRunID, StepRunning); got != 0 {
+		t.Errorf("StepRunning count = %d, want 0 (PerStep writes no per-vertex checkpoints)", got)
+	}
+
+	hist, err := store.History(context.Background(), res.Run.GraphRunID)
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	// Every appended checkpoint is a step boundary (or seed): StepRouted here.
+	for i, cp := range hist {
+		if cp.Phase != StepRouted {
+			t.Errorf("history[%d].Phase = %v, want StepRouted (PerStep writes only boundaries)", i, cp.Phase)
+		}
+	}
+	// Latest always sits on a prior step boundary.
+	latest := hist[len(hist)-1]
+	if latest.Phase != StepRouted {
+		t.Errorf("Latest Phase = %v, want StepRouted (a step boundary)", latest.Phase)
+	}
+}
+
+// TestRunGranularitySameFinalState proves granularity is a checkpoint-cadence
+// concern ONLY: PerVertex and PerStep runs of the same graph from the same input
+// produce the IDENTICAL final Result.State and the same terminal status — the
+// reduce/route logic and state advancement are unchanged, only the durable
+// per-vertex checkpoint differs (§10.1).
+func TestRunGranularitySameFinalState(t *testing.T) {
+	t.Parallel()
+
+	perVertex := compileGranularityFanOut(t, NewMemStore())
+	perStep := compileGranularityFanOut(t, NewMemStore())
+
+	resV, err := perVertex.Run(context.Background(), cnt{N: 7}, WithCheckpointEvery(PerVertex))
+	if err != nil {
+		t.Fatalf("PerVertex Run: %v", err)
+	}
+	resS, err := perStep.Run(context.Background(), cnt{N: 7}, WithCheckpointEvery(PerStep))
+	if err != nil {
+		t.Fatalf("PerStep Run: %v", err)
+	}
+
+	if resV.Run.Status != resS.Run.Status {
+		t.Errorf("status differs: PerVertex=%v PerStep=%v", resV.Run.Status, resS.Run.Status)
+	}
+	if !reflect.DeepEqual(resV.State, resS.State) {
+		t.Errorf("final State differs:\n PerVertex=%+v\n PerStep =%+v", resV.State, resS.State)
+	}
+}
+
+// TestRunGranularityHooksFireBothModes proves the lifecycle HOOKS fire per vertex
+// in BOTH modes — only the durable APPEND is gated (§10.1): OnVertexFinish fires
+// exactly once per vertex in PerVertex AND PerStep (equal counts), while
+// OnCheckpoint fires STRICTLY FEWER times in PerStep (no per-vertex StepRunning
+// writes). With a pause involved, OnInterrupt fires the same number of times in
+// both modes.
+func TestRunGranularityHooksFireBothModes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		granularity CheckpointGranularity
+	}{
+		{name: "per vertex", granularity: PerVertex},
+		{name: "per step", granularity: PerStep},
+	}
+
+	type result struct {
+		vertexFinish int
+		checkpoints  int
+		interrupts   int
+	}
+	runOne := func(t *testing.T, g CheckpointGranularity) result {
+		t.Helper()
+		store := NewMemStore()
+		graph := NewGraph[cnt](GraphID{})
+		// entry fans out to a (Awaiting) and b (Done) in the same super-step, so a
+		// pause exercises OnInterrupt while both still finish (OnVertexFinish).
+		addErrVertex(t, graph, vID(1), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "entry", nil }))
+		addErrVertex(t, graph, vID(2), interruptTask("approve A"))
+		addErrVertex(t, graph, vID(3), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "b", nil }))
+		addErrVertex(t, graph, vID(4), NewFuncTask(func(_ context.Context, _ int) (string, error) { return "fin", nil }))
+		r, _, _, _, _ := fanOutTwo(t, graph, store)
+
+		rc := &recorder{}
+		er := &errRecorder{}
+		if _, err := r.Run(context.Background(), cnt{}, WithCheckpointEvery(g), WithHooks(rc.hooks()), WithHooks(er.hooks())); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		rc.mu.Lock()
+		vf, cp := rc.vertexFinish, rc.checkpoints
+		rc.mu.Unlock()
+		er.mu.Lock()
+		iv := er.interrupts
+		er.mu.Unlock()
+		return result{vertexFinish: vf, checkpoints: cp, interrupts: iv}
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			res := runOne(t, tt.granularity)
+			// entry, a, b all finish (the pause vertex still fires OnVertexFinish).
+			if res.vertexFinish != 3 {
+				t.Errorf("OnVertexFinish fired %d times, want 3 (once per vertex regardless of granularity)", res.vertexFinish)
+			}
+		})
+	}
+
+	// Cross-mode comparison: run both sequentially for a deterministic compare.
+	pv := runOne(t, PerVertex)
+	ps := runOne(t, PerStep)
+	if pv.vertexFinish != ps.vertexFinish {
+		t.Errorf("OnVertexFinish counts differ: PerVertex=%d PerStep=%d, want equal", pv.vertexFinish, ps.vertexFinish)
+	}
+	if pv.interrupts != ps.interrupts {
+		t.Errorf("OnInterrupt counts differ: PerVertex=%d PerStep=%d, want equal", pv.interrupts, ps.interrupts)
+	}
+	if !(ps.checkpoints < pv.checkpoints) {
+		t.Errorf("OnCheckpoint PerStep=%d not strictly fewer than PerVertex=%d", ps.checkpoints, pv.checkpoints)
+	}
+}
+
+// TestRunPerStepPauseStillCheckpointed proves the step-boundary checkpoint is
+// NEVER gated by granularity (§10.1): a PerStep run that pauses still writes the
+// StepPaused boundary carrying the InterruptRecords, and Result.Interrupts is
+// correct — only the per-vertex StepRunning append is suppressed.
+func TestRunPerStepPauseStillCheckpointed(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, interruptTask("need human approval"))
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), cnt{}, WithCheckpointEvery(PerStep))
+	if err != nil {
+		t.Fatalf("Run returned engine error %v, want nil (awaiting is a Result)", err)
+	}
+	if res.Run.Status != RunInterrupted {
+		t.Fatalf("Status = %v, want RunInterrupted", res.Run.Status)
+	}
+	if len(res.Interrupts) != 1 || res.Interrupts[0].Kind != Awaiting {
+		t.Fatalf("Interrupts = %+v, want one Awaiting", res.Interrupts)
+	}
+
+	// No per-vertex StepRunning was written, but the StepPaused boundary IS.
+	if got := countPhase(t, store, res.Run.GraphRunID, StepRunning); got != 0 {
+		t.Errorf("StepRunning count = %d, want 0 (PerStep suppresses per-vertex writes)", got)
+	}
+	last := lastCheckpoint(t, store, res.Run.GraphRunID)
+	if last.Phase != StepPaused {
+		t.Fatalf("last Phase = %v, want StepPaused (boundary always written)", last.Phase)
+	}
+	if len(last.Interrupts) != 1 || last.Interrupts[0].Kind != Awaiting {
+		t.Errorf("StepPaused.Interrupts = %+v, want one Awaiting record (boundary carries records)", last.Interrupts)
+	}
+	var info string
+	if err := json.Unmarshal(last.Interrupts[0].Info, &info); err != nil || info != "need human approval" {
+		t.Errorf("InterruptRecord.Info = %s (err %v), want marshaled reason", last.Interrupts[0].Info, err)
+	}
+}

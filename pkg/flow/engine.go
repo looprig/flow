@@ -277,15 +277,16 @@ func newStepOutcome[S any]() *stepOutcome[S] {
 // (Awaiting or Errored-Pause). When true the step PAUSES and never routes (§9.2.5).
 func (o *stepOutcome[S]) paused() bool { return len(o.pauses) > 0 }
 
-// classifyStep performs §9.2.4 (PerVertex): in VertexID order each vertex reaches
-// exactly ONE terminal state via classifyVertex — Done (success reduced), Awaiting
+// classifyStep performs §9.2.4: in VertexID order each vertex reaches exactly ONE
+// terminal state via classifyVertex — Done (success reduced), Awaiting
 // (flow.Interrupt), Failed-Route (record reduced, handler activated), or
-// Errored-Pause (default Pause, or a record-reducer/success-reducer failure). After
-// each vertex's terminal effect it appends a StepRunning checkpoint carrying the
-// accumulated Interrupts so far (§10.1 — a paused vertex's checkpoint already
-// carries its InterruptRecord), fires OnVertexFinish, and fires OnInterrupt once
-// for a paused vertex. finishRan latches only on a Done finish (a paused/failed
-// finish has not executed to completion, §9.5).
+// Errored-Pause (default Pause, or a record-reducer/success-reducer failure). The
+// reduce/commit and the per-vertex HOOKS (OnVertexFinish always, OnInterrupt for a
+// paused vertex) fire once per vertex in BOTH granularities; ONLY the durable
+// per-vertex StepRunning APPEND is gated on PerVertex (§10.1). In PerStep no
+// per-vertex checkpoint is written — Latest sits on the prior step boundary and a
+// crash re-runs the whole frontier from StepBase. finishRan latches only on a Done
+// finish (a paused/failed finish has not executed to completion, §9.5).
 func (c *coordinator[S]) classifyStep(ctx context.Context, runs []*vertexRun[S]) (*stepOutcome[S], error) {
 	out := newStepOutcome[S]()
 	for _, r := range runs {
@@ -295,8 +296,10 @@ func (c *coordinator[S]) classifyStep(ctx context.Context, runs []*vertexRun[S])
 		if r.vs.Status == VertexDone && r.vs.VertexID == c.finish {
 			c.finishRan = true
 		}
-		if err := c.checkpointVertex(ctx, runs, out.records); err != nil {
-			return nil, err
+		if c.cfg.granularity == PerVertex {
+			if err := c.checkpointVertex(ctx, runs, out.records); err != nil {
+				return nil, err
+			}
 		}
 		c.cfg.hooks.onVertexFinish(ctx, r.vs)
 		if iv, ok := pauseFor(r, out); ok {
@@ -421,10 +424,11 @@ func (c *coordinator[S]) pauseErrored(r *vertexRun[S], out *stepOutcome[S]) {
 	})
 }
 
-// checkpointVertex appends a per-vertex StepRunning checkpoint (PerVertex, §10.1)
-// carrying the step's per-vertex records and the interrupt records accumulated so
-// far, so a paused vertex's InterruptRecord (and any continuation) survives a crash
-// before the step's final boundary checkpoint.
+// checkpointVertex appends a per-vertex StepRunning checkpoint (PerVertex only,
+// §10.1) carrying the step's per-vertex records and the interrupt records
+// accumulated so far, so a paused vertex's InterruptRecord (and any continuation)
+// survives a crash before the step's final boundary checkpoint. classifyStep gates
+// this call on granularity == PerVertex; in PerStep it is never invoked.
 func (c *coordinator[S]) checkpointVertex(ctx context.Context, runs []*vertexRun[S], records []InterruptRecord) error {
 	cp, err := c.checkpoint(StepRunning)
 	if err != nil {
