@@ -26,6 +26,16 @@ func (e *DuplicateVertexError) Error() string {
 	return "flow: duplicate vertex " + e.VertexID.String()
 }
 
+// DuplicateConditionalEdgeError reports that a second conditional out-edge was
+// added for a vertex that already has one; a vertex may have at most one
+// conditional edge, since a second would silently overwrite the first (§7).
+type DuplicateConditionalEdgeError struct{ From VertexID }
+
+// Error names the vertex with the duplicate conditional edge.
+func (e *DuplicateConditionalEdgeError) Error() string {
+	return "flow: duplicate conditional edge for vertex " + e.From.String()
+}
+
 // UnknownVertexError reports that an edge, condition, error-route, or checkpoint
 // frontier endpoint references a VertexID that is not in the compiled graph.
 // Used both at build (§8) and at checkpoint validation on load (§10.4).
@@ -64,6 +74,44 @@ type MissingEntryError struct {
 // Error names the absent role and the vertex it should have referenced.
 func (e *MissingEntryError) Error() string {
 	return "flow: missing " + e.Role + " vertex " + e.VertexID.String()
+}
+
+// BuildError reports a fail-fast violation of an add-time build invariant that
+// has no more specific typed error: a nil required argument (task, selector,
+// reducer, condition Pick) or a malformed identifier/parameter supplied to a
+// build call (a zero VertexID, an empty Condition.Targets, a second conditional
+// edge on a from that already has one). It is distinct from the structural
+// Compile checks (§8); those keep their own typed errors (UnknownVertexError,
+// AmbiguousRoutingError, …). Op names the failing build call (e.g. "AddVertex",
+// "AddEdge", "AddConditionalEdge") and Detail names the offending parameter so
+// an operator can identify the bad call from a log line.
+type BuildError struct {
+	Op     string // the build call: "AddVertex" | "AddEdge" | "AddConditionalEdge"
+	Detail string // the offending parameter, e.g. "nil task" or "zero from vertex"
+}
+
+// Error names the failing build call and the offending parameter.
+func (e *BuildError) Error() string {
+	return "flow: " + e.Op + ": " + e.Detail
+}
+
+// internalTypeError reports a failed type assertion at the engine's single
+// type-erasure seam (§6): a value boxed as any inside a vertex[S] closure did
+// not narrow back to the concrete I/O the binding was built with. This is an
+// INTERNAL INVARIANT violation that must never occur in normal flow (AddVertex
+// builds the closures and the matching boxers together), so it is unexported and
+// surfaced as a typed error — never a panic and never a leaked any — so the
+// coordinator can fail securely (CLAUDE.md: fail secure; never leak any to
+// callers). Want is the expected Go type, Got the actual one.
+type internalTypeError struct {
+	Seam string // the seam method: "execute" | "applyReducer"
+	Want string // expected concrete type
+	Got  string // actual type received
+}
+
+// Error names the seam, the expected type, and the type actually received.
+func (e *internalTypeError) Error() string {
+	return "flow: internal type error at " + e.Seam + ": expected " + e.Want + ", got " + e.Got
 }
 
 // --- Runtime errors (§9, §12) -----------------------------------------------
