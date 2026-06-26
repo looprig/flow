@@ -210,6 +210,18 @@ func (e *CheckpointDecodeError) Error() string {
 // Unwrap returns the underlying decode cause so errors.Is/As can inspect it.
 func (e *CheckpointDecodeError) Unwrap() error { return e.Err }
 
+// phaseComboError reports an invalid Phase/Interrupts/Halt combination in a loaded
+// checkpoint (§10.4): the persisted phase and the pause/halt fields contradict each
+// other (e.g. StepPaused with no Interrupts, or StepHalted carrying Interrupts). It
+// is UNEXPORTED — Resume wraps it in the exported CheckpointDecodeError (Field
+// "Phase") so callers errors.As the public type while the detail stays inspectable.
+type phaseComboError struct{ detail string }
+
+// Error names the contradicting combination.
+func (e *phaseComboError) Error() string {
+	return "flow: invalid checkpoint phase/interrupt/halt combination: " + e.detail
+}
+
 // CheckpointNotFoundError reports that no checkpoint exists for the given run,
 // so there is nothing to resume from (§10.2).
 type CheckpointNotFoundError struct{ GraphRunID GraphRunID }

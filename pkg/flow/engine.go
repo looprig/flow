@@ -100,6 +100,19 @@ func (c *coordinator[S]) run(ctx context.Context) (*Result[S], error) {
 	if err := c.seed(ctx); err != nil {
 		return nil, err
 	}
+	return c.loop(ctx)
+}
+
+// loop drives the super-step loop from the CURRENT frontier and step to a terminal
+// state (§9.2). It is the shared engine both run (after seeding) and resume (after
+// reconstructing the coordinator from a checkpoint, §9.3) re-enter: at the loop top
+// the step budget is a real HaltMaxSteps (§9.5); otherwise it freezes inputs, runs
+// the frontier, reduces + checkpoints, then finalizes (route + terminate folded
+// into one boundary checkpoint). finalizeStep returns the final Result on
+// completion/halt/pause, else advances the step. The error return is for
+// engine/infrastructure failures only (§12.3); a halt is in Result.Halt, never an
+// engine error.
+func (c *coordinator[S]) loop(ctx context.Context) (*Result[S], error) {
 	for {
 		if int(c.rs.Step) >= c.cfg.maxSteps {
 			return c.haltRun(ctx, HaltMaxSteps, &MaxStepsExceededError{Max: c.cfg.maxSteps, Step: c.rs.Step}, nil)
