@@ -263,20 +263,21 @@ func (e *GraphRunExistsError) Error() string {
 	return "flow: run " + e.GraphRunID.String() + " already exists"
 }
 
-// RevisionConflictError reports a failed compare-and-append: the revision we
-// tried to append is no longer next because another writer advanced the run.
-// Expected is the revision we attempted; Actual is the current latest (§10.2).
+// RevisionConflictError reports a failed compare-and-append: the supplied
+// revision was not the store's required next revision, because another writer
+// advanced the run (concurrent-resume detection, §10.2). Expected is the
+// revision the store required next (latest+1); Actual is the revision supplied.
 type RevisionConflictError struct {
 	GraphRunID GraphRunID
-	Expected   uint64 // revision we tried to append
-	Actual     uint64 // current latest revision
+	Expected   uint64 // the revision the store required next (latest+1)
+	Actual     uint64 // the revision actually supplied by the caller
 }
 
-// Error names the run and the attempted versus current revisions.
+// Error names the run and the expected-next versus supplied revisions.
 func (e *RevisionConflictError) Error() string {
 	return "flow: revision conflict for run " + e.GraphRunID.String() +
-		": tried to append revision " + strconv.FormatUint(e.Expected, 10) +
-		", current latest is " + strconv.FormatUint(e.Actual, 10)
+		": expected revision " + strconv.FormatUint(e.Expected, 10) +
+		", got " + strconv.FormatUint(e.Actual, 10)
 }
 
 // StoreError reports a failure of a CheckpointStore operation. Op names the
