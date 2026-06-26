@@ -1,12 +1,41 @@
 package uuid
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io"
 )
 
 // UUID is a 128-bit identifier stored as a raw 16-byte array.
 type UUID [16]byte
+
+// GenerateError reports a failure to read randomness while generating a UUID.
+// It wraps the underlying reader error so callers can errors.As to a
+// *GenerateError and errors.Unwrap (or read .Err) to inspect the cause.
+type GenerateError struct{ Err error }
+
+func (e *GenerateError) Error() string { return "uuid: generate: " + e.Err.Error() }
+
+func (e *GenerateError) Unwrap() error { return e.Err }
+
+// New returns a version-4 (random) UUID sourced from crypto/rand. It returns a
+// *GenerateError if the randomness source cannot supply 16 bytes.
+func New() (UUID, error) { return newFromReader(rand.Reader) }
+
+// newFromReader is the testable seam behind New: it reads 16 random bytes from r
+// and stamps the RFC-4122 version-4 and variant bits. A read failure (including
+// a short read) yields the zero UUID and a *GenerateError. It is unexported so
+// only New (with crypto/rand) is part of the public surface.
+func newFromReader(r io.Reader) (UUID, error) {
+	var u UUID
+	if _, err := io.ReadFull(r, u[:]); err != nil {
+		return UUID{}, &GenerateError{Err: err}
+	}
+	u[6] = (u[6] & 0x0f) | 0x40 // version 4
+	u[8] = (u[8] & 0x3f) | 0x80 // variant 10 (RFC 4122)
+	return u, nil
+}
 
 // errInvalidText is returned when UnmarshalText receives text that is not a
 // structurally valid 8-4-4-4-12 hyphenated encoding (wrong length, a hyphen off

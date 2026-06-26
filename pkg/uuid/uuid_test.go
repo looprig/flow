@@ -1,7 +1,9 @@
 package uuid
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"testing"
 )
 
@@ -168,6 +170,93 @@ func TestUUIDUnmarshalTextErrors(t *testing.T) {
 			}
 			if u != midValue {
 				t.Errorf("receiver mutated on failure = %v, want unchanged %v", u, midValue)
+			}
+		})
+	}
+}
+
+// TestNew verifies the structural invariants of a crypto/rand v4 UUID. The
+// payload is random, so we assert only RFC-4122 invariants and uniqueness, never
+// specific byte values: version nibble 4, variant bits 10, non-zero, and that
+// successive calls differ.
+func TestNew(t *testing.T) {
+	t.Parallel()
+	const iterations = 100
+	prev, err := New()
+	if err != nil {
+		t.Fatalf("New() err = %v", err)
+	}
+	for i := 0; i < iterations; i++ {
+		u, err := New()
+		if err != nil {
+			t.Fatalf("New() iteration %d err = %v", i, err)
+		}
+		if got := u[6] >> 4; got != 0x4 {
+			t.Errorf("iteration %d: version nibble = %#x, want 0x4", i, got)
+		}
+		if got := u[8] & 0xc0; got != 0x80 {
+			t.Errorf("iteration %d: variant bits = %#x, want 0x80", i, got)
+		}
+		if u.IsZero() {
+			t.Errorf("iteration %d: New() returned zero UUID", i)
+		}
+		if u == prev {
+			t.Errorf("iteration %d: New() returned duplicate of previous %v", i, u)
+		}
+		prev = u
+	}
+}
+
+// errReader is a reader that always fails, used to drive the GenerateError path.
+type errReader struct{ err error }
+
+func (r errReader) Read(_ []byte) (int, error) { return 0, r.err }
+
+// TestNewGenerateError exercises the read-failure path via the newFromReader
+// seam. Both an explicit reader error and a short read (fewer than 16 bytes,
+// surfaced by io.ReadFull as io.ErrUnexpectedEOF) must yield a *GenerateError
+// that unwraps to the underlying reader error.
+func TestNewGenerateError(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("boom")
+	tests := []struct {
+		name    string
+		reader  io.Reader
+		wantErr error
+	}{
+		{
+			name:    "explicit reader error",
+			reader:  errReader{err: sentinel},
+			wantErr: sentinel,
+		},
+		{
+			name:    "short read fewer than 16 bytes",
+			reader:  bytes.NewReader([]byte{0x00, 0x01, 0x02}),
+			wantErr: io.ErrUnexpectedEOF,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := newFromReader(tt.reader)
+			if err == nil {
+				t.Fatalf("newFromReader() err = nil, want error")
+			}
+			if !got.IsZero() {
+				t.Errorf("newFromReader() = %v on error, want zero UUID", got)
+			}
+			var genErr *GenerateError
+			if !errors.As(err, &genErr) {
+				t.Fatalf("newFromReader() err = %v, want *GenerateError", err)
+			}
+			if !errors.Is(genErr.Err, tt.wantErr) {
+				t.Errorf("GenerateError.Err = %v, want %v", genErr.Err, tt.wantErr)
+			}
+			if !errors.Is(errors.Unwrap(err), tt.wantErr) {
+				t.Errorf("errors.Unwrap(err) = %v, want %v", errors.Unwrap(err), tt.wantErr)
+			}
+			if want := "uuid: generate: " + tt.wantErr.Error(); err.Error() != want {
+				t.Errorf("Error() = %q, want %q", err.Error(), want)
 			}
 		})
 	}
