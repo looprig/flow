@@ -21,3 +21,10 @@ coverage.*
 .idea/
 .vscode/
 .DS_Store
+
+# Vendored dependency tree — committed in full and built offline (-mod=vendor).
+# The global ignores above (*.a, *.o, *.so, *.test, *.out, coverage.*, *.prof,
+# ...) otherwise silently drop matching vendored files, yielding a tree that
+# fails `go build`/`go test` from a clean checkout. This negation must stay
+# LAST so it re-includes everything under vendor/.
+!/vendor/**
