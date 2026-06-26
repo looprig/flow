@@ -22,7 +22,8 @@
   4. Run the test; confirm it passes.
   5. Commit (message given per task).
 - **Every test is table-driven, every subtest calls `t.Parallel()`, every run uses `-race`** (CLAUDE.md). Each table must cover: happy path, boundary (zero/empty/single/max), error cases, and the domain edges listed in the task.
-- **Standard verification command** (run before every commit): `gofmt -l . && CGO_ENABLED=0 go build -trimpath ./... && go test -race ./...`. Milestones that add fuzz/integration/static-analysis name the extra command explicitly.
+- **Workspace:** A parent `go.work` at `/Users/ipotter/code/go.work` does not list `./flows`, so **all `go` commands in this repo must run with `GOWORK=off`** (the standing decision — flows is consumed as a standalone module). Prefix every `go`/`gofmt` invocation accordingly.
+- **Standard verification command** (run before every commit): `GOWORK=off gofmt -l . && GOWORK=off CGO_ENABLED=0 go build -trimpath ./... && GOWORK=off go test -race ./...`. Milestones that add fuzz/integration/static-analysis name the extra command explicitly.
 - **Required skills while executing:** `superpowers:test-driven-development` (every task), `superpowers:systematic-debugging` (any failure), `superpowers:requesting-code-review` (end of each phase), `superpowers:verification-before-completion` (before any "done" claim).
 - **Module path:** `github.com/ciram-co/flow`; engine package import path `github.com/ciram-co/flow/pkg/flow` (§1). All paths below are relative to repo root `/Users/ipotter/code/flows`.
 
@@ -39,7 +40,7 @@
 
 **Files:**
 - Create: `go.mod`, `.gitignore`
-- Create (empty package dirs with a `doc.go` each): `pkg/uuid/`, `pkg/flow/`, `controlplane/`, `registry/`, `ingress/`
+- Create (empty package dirs with a `doc.go` each): `pkg/uuid/`, `pkg/flow/`, `pkg/controlplane/`, `pkg/registry/`, `pkg/ingress/` (all service packages live **under `pkg/`** per §14 and the §18.6 import paths — e.g. `github.com/ciram-co/flow/pkg/controlplane`)
 
 **Steps:**
 1. `git init` (repo does not exist yet); confirm `CLAUDE.md`, `AGENTS.md`, `docs/` are present and untracked.
@@ -488,7 +489,7 @@
 
 ### Task 8.1: `registry` — `RunnerHandle` + `(GraphID,GraphVersion)` resolver
 
-**Files:** Create `registry/registry.go`, `registry/registry_test.go`; add `RunnerHandle` seam in `pkg/flow` (a graph-agnostic JSON-in/out wrapper over a typed `Runner[S]`, §18.1).
+**Files:** Create `pkg/registry/registry.go`, `pkg/registry/registry_test.go`; add `RunnerHandle` seam in `pkg/flow` (a graph-agnostic JSON-in/out wrapper over a typed `Runner[S]`, §18.1).
 
 **Design contract:** §18.1 — the registry is a **pure resolver** (no execution, no cross-worker routing); keyed by `(GraphID, GraphVersion)`; one process can serve multiple versions.
 
@@ -499,7 +500,7 @@
 
 ### Task 8.2: `controlplane` — interface, `Work`/`Delivery`, `controlplane.Mem`
 
-**Files:** Create `controlplane/controlplane.go`, `controlplane/mem.go`, `controlplane/controlplane_test.go`.
+**Files:** Create `pkg/controlplane/controlplane.go`, `pkg/controlplane/mem.go`, `pkg/controlplane/controlplane_test.go`.
 
 **Design contract:** §18.5 — `ControlPlane` interface (`Submit`/`Consume`); `Delivery` with explicit `Ack`/`Nack`; **single-flight per run**; control plane is **separate** from `CheckpointStore`.
 
@@ -521,7 +522,7 @@
 
 ### Task 8.4: `ingress` — HTTP handler, routes, error mapping
 
-**Files:** Create `ingress/ingress.go`, `ingress/ingress_test.go`.
+**Files:** Create `pkg/ingress/ingress.go`, `pkg/ingress/ingress_test.go`.
 
 **Design contract:** §18.3 — the route table, **async-first** (pre-mint `GraphRunID`, return `202 + GraphRunID`), `graphVersion` on every run response, typed-error→status mapping, secure defaults (explicit server timeouts, TLS ≥1.2 config, body-size limits), `WithAuth` seam (never bakes a scheme), `Idempotency-Key` dedup (persisted `key→GraphRunID`), `409 + X-Graph-Version` on resume version mismatch.
 
