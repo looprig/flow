@@ -27,6 +27,24 @@ const (
 	RunCancelled                    // terminal: Cancel(id) appended a final checkpoint (§18.2); cannot resume
 )
 
+// String renders a RunStatus as a human-readable token for hooks, HTTP, and
+// logging. It satisfies fmt.Stringer; an unrecognized value falls back to its
+// decimal form so the integer is never lost.
+func (s RunStatus) String() string {
+	switch s {
+	case RunRunning:
+		return "Running"
+	case RunCompleted:
+		return "Completed"
+	case RunInterrupted:
+		return "Interrupted"
+	case RunCancelled:
+		return "Cancelled"
+	default:
+		return "RunStatus(" + strconv.Itoa(int(s)) + ")"
+	}
+}
+
 // GraphRunState is the run-level instrumentation record: identity, status, step,
 // revision, and lifecycle timestamps for one graph run (§4.1).
 type GraphRunState struct {
@@ -56,6 +74,26 @@ const (
 	VertexInterrupted
 	VertexFailed
 )
+
+// String renders a VertexStatus as a human-readable token for hooks, HTTP, and
+// logging. It satisfies fmt.Stringer; an unrecognized value falls back to its
+// decimal form so the integer is never lost.
+func (s VertexStatus) String() string {
+	switch s {
+	case VertexPending:
+		return "Pending"
+	case VertexRunning:
+		return "Running"
+	case VertexDone:
+		return "Done"
+	case VertexInterrupted:
+		return "Interrupted"
+	case VertexFailed:
+		return "Failed"
+	default:
+		return "VertexStatus(" + strconv.Itoa(int(s)) + ")"
+	}
+}
 
 // VertexState is the per-vertex-execution instrumentation record: identity,
 // status, attempt, and lifecycle timestamps (§4.1).
@@ -97,6 +135,7 @@ type IdempotencyKey string
 func (i RunInfo) IdempotencyKey() IdempotencyKey {
 	return IdempotencyKey("graph=" + i.GraphID.String() +
 		"/run=" + i.GraphRunID.String() +
+		// strconv.Itoa, not Step.String(): the key is a durable contract, decoupled from the Stringer.
 		"/step=" + strconv.Itoa(int(i.Step)) +
 		"/vertex=" + i.VertexID.String())
 }

@@ -283,32 +283,6 @@ func TestErrorUnwrap(t *testing.T) {
 	}
 }
 
-// TestRunStatusName covers the readable-status rendering used by
-// ResumeTerminalError, including the decimal fallback for an unrecognized value.
-func TestRunStatusName(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		status RunStatus
-		want   string
-	}{
-		{name: "running", status: RunRunning, want: "Running"},
-		{name: "completed", status: RunCompleted, want: "Completed"},
-		{name: "interrupted", status: RunInterrupted, want: "Interrupted"},
-		{name: "cancelled", status: RunCancelled, want: "Cancelled"},
-		{name: "unrecognized falls back to decimal", status: RunStatus(99), want: "99"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := runStatusName(tt.status); got != tt.want {
-				t.Errorf("runStatusName(%d) = %q, want %q", tt.status, got, tt.want)
-			}
-		})
-	}
-}
-
 // TestInterruptSignal verifies the internal interrupt seam: asInterrupt detects
 // an *interruptSignal directly and through a %w wrap, returns the carried
 // info/continuation/stateful unchanged, and reports false for a non-interrupt

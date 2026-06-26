@@ -58,6 +58,58 @@ func TestVertexStatusValues(t *testing.T) {
 	}
 }
 
+// TestRunStatusString covers RunStatus's fmt.Stringer rendering for each named
+// value and the decimal fallback for an out-of-range value (the form callers in
+// hooks/HTTP/logging — and ResumeTerminalError — rely on).
+func TestRunStatusString(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		status RunStatus
+		want   string
+	}{
+		{name: "RunRunning", status: RunRunning, want: "Running"},
+		{name: "RunCompleted", status: RunCompleted, want: "Completed"},
+		{name: "RunInterrupted", status: RunInterrupted, want: "Interrupted"},
+		{name: "RunCancelled", status: RunCancelled, want: "Cancelled"},
+		{name: "unknown falls back to decimal", status: RunStatus(99), want: "RunStatus(99)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.status.String(); got != tt.want {
+				t.Errorf("RunStatus(%d).String() = %q, want %q", int(tt.status), got, tt.want)
+			}
+		})
+	}
+}
+
+// TestVertexStatusString covers VertexStatus's fmt.Stringer rendering for each
+// named value and the decimal fallback for an out-of-range value.
+func TestVertexStatusString(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		status VertexStatus
+		want   string
+	}{
+		{name: "VertexPending", status: VertexPending, want: "Pending"},
+		{name: "VertexRunning", status: VertexRunning, want: "Running"},
+		{name: "VertexDone", status: VertexDone, want: "Done"},
+		{name: "VertexInterrupted", status: VertexInterrupted, want: "Interrupted"},
+		{name: "VertexFailed", status: VertexFailed, want: "Failed"},
+		{name: "unknown falls back to decimal", status: VertexStatus(99), want: "VertexStatus(99)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.status.String(); got != tt.want {
+				t.Errorf("VertexStatus(%d).String() = %q, want %q", int(tt.status), got, tt.want)
+			}
+		})
+	}
+}
+
 // graphIDLiteral / runIDLiteral / vertexIDLiteral / vertexRunIDLiteral are
 // distinct pinned UUID literals so round-trip and IdempotencyKey assertions can
 // tell the fields apart in a single fixture.

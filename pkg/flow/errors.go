@@ -178,26 +178,7 @@ type ResumeTerminalError struct{ Status RunStatus }
 
 // Error names the terminal status that blocks the resume.
 func (e *ResumeTerminalError) Error() string {
-	return "flow: cannot resume run in terminal status " + runStatusName(e.Status)
-}
-
-// runStatusName renders a RunStatus as a readable token for error messages.
-// It lives here (not in state.go) so this catalogue stays self-contained and
-// produces operator-legible messages without a String() method on the enum;
-// an unrecognized value falls back to its decimal form.
-func runStatusName(s RunStatus) string {
-	switch s {
-	case RunRunning:
-		return "Running"
-	case RunCompleted:
-		return "Completed"
-	case RunInterrupted:
-		return "Interrupted"
-	case RunCancelled:
-		return "Cancelled"
-	default:
-		return strconv.Itoa(int(s))
-	}
+	return "flow: cannot resume run in terminal status " + e.Status.String()
 }
 
 // GraphMismatchError reports that a loaded checkpoint's GraphID does not match
