@@ -14,12 +14,14 @@ import (
 // coordinator goroutine commits it (vertex goroutines return outputs; the
 // coordinator reduces them single-threaded in VertexID order, §9.4).
 //
-// SCOPE: the LINEAR happy path — single-vertex frontiers, single static out-edge
-// routing, PerVertex checkpoints (§9.2 steps 1–6 for the linear case). Fan-out /
-// cycles / HaltMaxSteps, the concurrency bound, conditional routing, error
-// policy, interrupts/pause, PerStep behavior, and Resume are later sub-tasks. The
-// loop and frontier model are structured so those extensions slot in without
-// reworking the skeleton.
+// SCOPE: static-edge routing (§9.2 steps 1–6) — fan-out (a vertex with several
+// static out-edges activates them all), fan-in (a vertex reached by several edges
+// is deduped to one frontier entry, §9.6), and the two STRUCTURAL run-level halts
+// (HaltMaxSteps and HaltDeadEnd, §9.5/§9.8). Route + terminate are folded into one
+// boundary checkpoint per step (finalizeStep). The concurrency bound, conditional
+// routing (HaltCondition/HaltUndeclaredTarget), error policy, interrupts/pause,
+// PerStep behavior, and Resume are later sub-tasks. The loop and frontier model
+// are structured so those extensions slot in without reworking the skeleton.
 
 // coordinator drives one graph run's super-step loop (§9.2). It is unexported and
 // single-use: Run builds one per call. It is the sole writer of state; the
@@ -30,6 +32,9 @@ import (
 // captured in runStep before any vertex runs so every checkpoint written within
 // the step carries the SAME base even as state advances during reduce (§9.2.2,
 // §10.1). It is nil before the first step (the seed has no frozen base).
+// finishRan records whether the finish vertex has executed in ANY step so far —
+// completion (§9.5) requires finish to have run at least once and then the
+// frontier to drain, so this is a run-spanning latch, NOT a this-step check.
 type coordinator[S any] struct {
 	graph        *Graph[S]
 	entry        VertexID
@@ -40,6 +45,7 @@ type coordinator[S any] struct {
 	rs           GraphRunState
 	frontier     []VertexID
 	stepBaseJSON json.RawMessage
+	finishRan    bool
 }
 
 // newCoordinator constructs a coordinator for one run from the runner, the
@@ -72,19 +78,23 @@ type vertexRun[S any] struct {
 }
 
 // run executes the full super-step loop to a terminal state (§9.2). It seeds the
-// run, then loops: freeze inputs, run the frontier, reduce + checkpoint, route,
-// and terminate when finish has executed and the frontier drains. It returns the
-// final Result or an engine/infrastructure error (store, id, or serialization
-// failure — §12.3). The maxSteps guard is a runaway safety bound here, not the
-// §9.5 HaltMaxSteps feature (a later sub-task); a linear chain always reaches
-// finish well within it. The MaxStepsExceededError it returns is BORROWED from
-// the §9.5 HaltMaxSteps feature and will be RE-HOMED to a Result.Halt (not an
-// engine error) in Task 6.2; today it only surfaces the runaway guard.
+// run, then loops: at the loop top the step budget (WithMaxSteps) is a real
+// run-level HaltMaxSteps (§9.5) — when the pending frontier would push past the
+// budget the run halts with that frontier recorded, so a resume with a higher
+// WithMaxSteps continues from it. Otherwise it freezes inputs, runs the frontier,
+// reduces + checkpoints, then finalizes (route + terminate folded into one
+// boundary checkpoint): finalizeStep returns the final Result when the run
+// completes or dead-ends, else advances the step. The error return is for
+// engine/infrastructure failures only (store, id, serialization — §12.3); a halt
+// is surfaced in Result.Halt, NEVER as an engine error (§9.8, §12.3).
 func (c *coordinator[S]) run(ctx context.Context) (*Result[S], error) {
 	if err := c.seed(ctx); err != nil {
 		return nil, err
 	}
-	for step := 0; step < c.cfg.maxSteps; step++ {
+	for {
+		if int(c.rs.Step) >= c.cfg.maxSteps {
+			return c.haltRun(ctx, HaltMaxSteps, &MaxStepsExceededError{Max: c.cfg.maxSteps, Step: c.rs.Step}, nil)
+		}
 		runs, err := c.runStep(ctx)
 		if err != nil {
 			return nil, err
@@ -92,11 +102,7 @@ func (c *coordinator[S]) run(ctx context.Context) (*Result[S], error) {
 		if err := c.reduceStep(ctx, runs); err != nil {
 			return nil, err
 		}
-		next, err := c.routeStep(ctx, runs)
-		if err != nil {
-			return nil, err
-		}
-		done, res, err := c.terminate(ctx, runs, next)
+		res, done, err := c.finalizeStep(ctx, runs)
 		if err != nil {
 			return nil, err
 		}
@@ -104,11 +110,7 @@ func (c *coordinator[S]) run(ctx context.Context) (*Result[S], error) {
 			return res, nil
 		}
 		c.rs.Step++
-		c.frontier = next
 	}
-	// Runaway guard only: borrowed from §9.5 HaltMaxSteps, re-homed to Result.Halt
-	// in Task 6.2. A valid linear chain reaches finish before this.
-	return nil, &MaxStepsExceededError{Max: c.cfg.maxSteps, Step: c.rs.Step}
 }
 
 // seed performs §9.2.1: stamp the run-level timestamps and Running status, set
@@ -226,9 +228,15 @@ func (c *coordinator[S]) execVertex(ctx context.Context, r *vertexRun[S]) {
 // each vertex's reducer into the accumulator (so a reducer that mutates then
 // errors leaves S unchanged), mark the vertex Done, and append a per-vertex
 // checkpoint reflecting the new state. It fires OnVertexFinish + OnCheckpoint per
-// vertex. The happy path has no reducer/clone error; full error policy is later.
+// vertex. When the finish vertex is among the executed vertices it latches
+// finishRan (the run-spanning completion signal of §9.5, set on the step finish
+// runs, never cleared). The happy path has no reducer/clone error; full error
+// policy is later.
 func (c *coordinator[S]) reduceStep(ctx context.Context, runs []*vertexRun[S]) error {
 	for _, r := range runs {
+		if r.vs.VertexID == c.finish {
+			c.finishRan = true
+		}
 		next, err := clone(c.state)
 		if err != nil {
 			return err
@@ -253,12 +261,37 @@ func (c *coordinator[S]) reduceStep(ctx context.Context, runs []*vertexRun[S]) e
 	return nil
 }
 
-// routeStep performs §9.2.5 (static single-edge routing): for each done vertex
-// compute its static successors, record the routing decision, and append a
-// StepRouted checkpoint carrying the next deduped frontier. It fires OnEdge per
-// edge and OnStep once. Conditional routing and error-route handling are later
-// sub-tasks; this handles only static AddEdge out-edges.
-func (c *coordinator[S]) routeStep(ctx context.Context, runs []*vertexRun[S]) ([]VertexID, error) {
+// finalizeStep performs §9.2.5–9.2.6 as ONE step boundary (the route+terminate
+// fold): it computes the static routing decisions and the next deduped frontier
+// (§9.5/§9.6), sets c.frontier to it, then writes EXACTLY ONE boundary checkpoint
+// and decides the step's fate. It returns (result, done, err): done with a
+// non-nil result completes or halts the run; done false advances to the next
+// step. Three outcomes:
+//   - complete (frontier empty AND finish ran in some step) — §9.5;
+//   - dead end (frontier empty, finish never ran) — HaltDeadEnd (§9.5/§9.8);
+//   - advance (frontier non-empty) — append the StepRouted boundary and continue.
+//
+// Only static AddEdge out-edges are routed; conditional routing is a later
+// sub-task.
+func (c *coordinator[S]) finalizeStep(ctx context.Context, runs []*vertexRun[S]) (*Result[S], bool, error) {
+	routes, next := c.computeRoutes(runs)
+	c.frontier = next
+
+	if len(next) == 0 {
+		if !c.finishRan {
+			res, err := c.haltRun(ctx, HaltDeadEnd, &DeadEndError{Step: c.rs.Step}, runs)
+			return res, true, err
+		}
+		return c.complete(ctx, runs, routes)
+	}
+	return c.advance(ctx, runs, routes, next)
+}
+
+// computeRoutes derives, from the step's executed vertices, the static routing
+// decisions (one RouteRecord per from with ≥1 out-edge, Conditional false) and
+// the next frontier as the deduped, VertexID-sorted union of all successors
+// (§9.5 routing, §9.6 fan-in dedup). It mutates nothing.
+func (c *coordinator[S]) computeRoutes(runs []*vertexRun[S]) ([]RouteRecord, []VertexID) {
 	var routes []RouteRecord
 	next := newVertexSet()
 	for _, r := range runs {
@@ -268,54 +301,87 @@ func (c *coordinator[S]) routeStep(ctx context.Context, runs []*vertexRun[S]) ([
 		}
 		next.addAll(succ)
 	}
-	frontier := next.ordered()
-
-	cp, err := c.checkpoint(StepRouted)
-	if err != nil {
-		return nil, err
-	}
-	cp.Frontier = frontier
-	cp.Routes = routes
-	cp.Vertices = vertexStates(runs)
-	if err := c.append(ctx, cp); err != nil {
-		return nil, err
-	}
-	c.fireRoutes(ctx, routes)
-	c.cfg.hooks.onStep(ctx, c.rs, len(runs))
-	return frontier, nil
+	return routes, next.ordered()
 }
 
-// fireRoutes fires OnEdge for every (from, to) pair in the recorded routes.
-func (c *coordinator[S]) fireRoutes(ctx context.Context, routes []RouteRecord) {
+// complete finalizes a completed run (§9.2.6, §9.5): mark Completed/CompletedAt,
+// append the SINGLE StepRouted boundary checkpoint (empty next frontier), fire
+// the routing hooks then OnRunFinish, and return the final Result.
+func (c *coordinator[S]) complete(ctx context.Context, runs []*vertexRun[S], routes []RouteRecord) (*Result[S], bool, error) {
+	c.rs.Status = RunCompleted
+	c.rs.CompletedAt = time.Now()
+	if err := c.appendRouted(ctx, runs, routes, nil); err != nil {
+		return nil, false, err
+	}
+	c.fireRouting(ctx, routes, len(runs))
+	c.cfg.hooks.onRunFinish(ctx, c.rs)
+	return &Result[S]{Run: c.rs, State: c.state}, true, nil
+}
+
+// advance finalizes a continuing step (§9.2.5): append the SINGLE StepRouted
+// boundary checkpoint carrying the next frontier, fire the routing hooks, and
+// signal the loop to advance (done false).
+func (c *coordinator[S]) advance(ctx context.Context, runs []*vertexRun[S], routes []RouteRecord, next []VertexID) (*Result[S], bool, error) {
+	if err := c.appendRouted(ctx, runs, routes, next); err != nil {
+		return nil, false, err
+	}
+	c.fireRouting(ctx, routes, len(runs))
+	return nil, false, nil
+}
+
+// appendRouted writes one StepRouted boundary checkpoint carrying the routing
+// decisions, the next frontier, and the step's per-vertex records. It is the
+// single boundary write per step (the route+terminate fold).
+func (c *coordinator[S]) appendRouted(ctx context.Context, runs []*vertexRun[S], routes []RouteRecord, next []VertexID) error {
+	cp, err := c.checkpoint(StepRouted)
+	if err != nil {
+		return err
+	}
+	cp.Frontier = next
+	cp.Routes = routes
+	cp.Vertices = vertexStates(runs)
+	return c.append(ctx, cp)
+}
+
+// fireRouting fires OnEdge for every traversed (from, to) edge then OnStep once
+// for the step that activated `activated` vertices.
+func (c *coordinator[S]) fireRouting(ctx context.Context, routes []RouteRecord, activated int) {
 	for _, rec := range routes {
 		for _, to := range rec.To {
 			c.cfg.hooks.onEdge(ctx, rec.From, to, c.rs)
 		}
 	}
+	c.cfg.hooks.onStep(ctx, c.rs, activated)
 }
 
-// terminate performs §9.2.6: if the finish vertex executed this step and the next
-// frontier is empty, mark the run Completed, append a final checkpoint (so Latest
-// durably reflects completion), fire OnRunFinish, and return the Result.
-// Otherwise it signals the loop to advance to the next step. A linear chain
-// always reaches finish, so the happy path always terminates here.
-func (c *coordinator[S]) terminate(ctx context.Context, runs []*vertexRun[S], next []VertexID) (bool, *Result[S], error) {
-	if len(next) != 0 || !ranFinish(runs, c.finish) {
-		return false, nil, nil
-	}
-	c.rs.Status = RunCompleted
-	c.rs.CompletedAt = time.Now()
+// haltRun records a run-level structural halt (§9.5, §9.8) — HaltMaxSteps or
+// HaltDeadEnd here — as a Result, NEVER an engine error. It marks the run
+// RunInterrupted/InterruptedAt, appends a StepHalted checkpoint whose StepBase and
+// State are BOTH the committed state (a halt's resume re-derives the frontier's
+// inputs from the committed state, so the base IS the current state — overriding
+// checkpoint()'s stale stepBaseJSON), records the cause and the frontier that
+// would have run (so resume can continue/retry), fires OnHalt, and returns a
+// Result with Halt set and Interrupts nil (mutually exclusive, §9.8). runs may be
+// empty (HaltMaxSteps at the loop top has no per-step runs).
+func (c *coordinator[S]) haltRun(ctx context.Context, kind HaltKind, cause error, runs []*vertexRun[S]) (*Result[S], error) {
+	c.rs.Status = RunInterrupted
+	c.rs.InterruptedAt = time.Now()
 
-	cp, err := c.checkpoint(StepRouted)
+	cp, err := c.checkpoint(StepHalted)
 	if err != nil {
-		return false, nil, err
+		return nil, err
 	}
+	cp.StepBase = cp.State // a halt resumes from the committed state, not a frozen base
+	cp.Halt = &HaltRecord{Kind: kind, Step: c.rs.Step, Cause: cause.Error()}
+	cp.Frontier = c.frontier
 	cp.Vertices = vertexStates(runs)
 	if err := c.append(ctx, cp); err != nil {
-		return false, nil, err
+		return nil, err
 	}
-	c.cfg.hooks.onRunFinish(ctx, c.rs)
-	return true, &Result[S]{Run: c.rs, State: c.state}, nil
+
+	h := &Halt{GraphRunID: c.rs.GraphRunID, Kind: kind, Step: c.rs.Step, Cause: cause}
+	c.cfg.hooks.onHalt(ctx, *h)
+	return &Result[S]{Run: c.rs, State: c.state, Halt: h}, nil
 }
 
 // checkpoint builds a Checkpoint for the given phase, marshaling the accumulated S
@@ -350,17 +416,6 @@ func (c *coordinator[S]) append(ctx context.Context, cp *Checkpoint) error {
 	c.cfg.hooks.onCheckpoint(ctx, c.rs.GraphRunID, c.rs.Revision, c.rs.Step)
 	c.rs.Revision++
 	return nil
-}
-
-// ranFinish reports whether the finish vertex was among the vertices that
-// executed this step.
-func ranFinish[S any](runs []*vertexRun[S], finish VertexID) bool {
-	for _, r := range runs {
-		if r.vs.VertexID == finish {
-			return true
-		}
-	}
-	return false
 }
 
 // vertexStates extracts the per-vertex records from a step's runs for a
