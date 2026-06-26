@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -168,6 +169,12 @@ func TestUUIDUnmarshalTextErrors(t *testing.T) {
 			if !errors.Is(err, errInvalidText) {
 				t.Errorf("UnmarshalText(%q) err = %v, want errInvalidText", tt.text, err)
 			}
+			// UnmarshalText now delegates to Parse, so a bad encoding must
+			// surface a *ParseError that still unwraps to errInvalidText.
+			var parseErr *ParseError
+			if !errors.As(err, &parseErr) {
+				t.Errorf("UnmarshalText(%q) err = %v, want *ParseError", tt.text, err)
+			}
 			if u != midValue {
 				t.Errorf("receiver mutated on failure = %v, want unchanged %v", u, midValue)
 			}
@@ -260,4 +267,143 @@ func TestNewGenerateError(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestParse covers the canonical happy path, case-insensitive decode, and the
+// full set of structural/hex failures. Every error row asserts a *ParseError
+// (errors.As) that also unwraps to the leaf sentinel errInvalidText, and that
+// the returned UUID is the zero value (fail-secure: no partial value on error).
+func TestParse(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		input   string
+		want    UUID
+		wantErr bool
+	}{
+		{name: "zero", input: "00000000-0000-0000-0000-000000000000", want: UUID{}},
+		{name: "mid value lowercase", input: midValueStr, want: midValue},
+		{name: "uppercase accepted", input: "01020304-0506-0708-090A-0B0C0D0E0F10", want: midValue},
+		{
+			name:  "all 0xff",
+			input: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+			want: UUID{
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+				0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			},
+		},
+		{name: "empty", input: "", wantErr: true},
+		{name: "too short", input: "01020304-0506-0708-090a-0b0c0d0e0f1", wantErr: true},
+		{name: "too long", input: "01020304-0506-0708-090a-0b0c0d0e0f100", wantErr: true},
+		{name: "missing hyphens", input: "010203040506070890a0b0c0d0e0f10000", wantErr: true},
+		{name: "hyphen at wrong position", input: "0102030-40506-0708-090a-0b0c0d0e0f10", wantErr: true},
+		{name: "non-hex digit in hex field", input: "0102030g-0506-0708-090a-0b0c0d0e0f10", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := Parse(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Parse(%q) err = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var parseErr *ParseError
+				if !errors.As(err, &parseErr) {
+					t.Errorf("Parse(%q) err = %v, want *ParseError", tt.input, err)
+				}
+				if !errors.Is(err, errInvalidText) {
+					t.Errorf("Parse(%q) err = %v, want unwrap to errInvalidText", tt.input, err)
+				}
+				// The message must surface the offending input and the leaf cause.
+				if msg := parseErr.Error(); !strings.Contains(msg, errInvalidText.Error()) ||
+					!strings.Contains(msg, "uuid: parse") {
+					t.Errorf("ParseError.Error() = %q, want it to mention parse and the cause", msg)
+				}
+				if !got.IsZero() {
+					t.Errorf("Parse(%q) = %v on error, want zero UUID", tt.input, got)
+				}
+				return
+			}
+			if got != tt.want {
+				t.Errorf("Parse(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+			// Parse(s).String() must round-trip through the canonical form.
+			if reparsed, err := Parse(got.String()); err != nil || reparsed != got {
+				t.Errorf("Parse(Parse(%q).String()) = (%v, %v), want (%v, nil)", tt.input, reparsed, err, got)
+			}
+		})
+	}
+}
+
+// TestMustParse verifies the panic-on-error contract used to pin const IDs: a
+// valid string returns the expected UUID; an invalid string panics.
+func TestMustParse(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		input     string
+		want      UUID
+		wantPanic bool
+	}{
+		{name: "valid", input: midValueStr, want: midValue},
+		{name: "uppercase valid", input: "01020304-0506-0708-090A-0B0C0D0E0F10", want: midValue},
+		{name: "invalid panics", input: "not-a-uuid", wantPanic: true},
+		{name: "empty panics", input: "", wantPanic: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			defer func() {
+				r := recover()
+				if (r != nil) != tt.wantPanic {
+					t.Fatalf("MustParse(%q) panic = %v, wantPanic %v", tt.input, r, tt.wantPanic)
+				}
+			}()
+			got := MustParse(tt.input)
+			if tt.wantPanic {
+				t.Fatalf("MustParse(%q) returned %v, want panic", tt.input, got)
+			}
+			if got != tt.want {
+				t.Errorf("MustParse(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// FuzzParse asserts the two safety/normalization properties of the parser
+// against arbitrary input: Parse never panics, and any input it accepts
+// round-trips through its own canonical String form to an equal value.
+func FuzzParse(f *testing.F) {
+	seeds := []string{
+		"00000000-0000-0000-0000-000000000000",
+		midValueStr,
+		"01020304-0506-0708-090A-0B0C0D0E0F10",
+		"ffffffff-ffff-ffff-ffff-ffffffffffff",
+		"",
+		"01020304-0506-0708-090a-0b0c0d0e0f1",   // too short
+		"01020304-0506-0708-090a-0b0c0d0e0f100", // too long
+		"0102030g-0506-0708-090a-0b0c0d0e0f10",  // non-hex
+		"010203040506070890a0b0c0d0e0f10000",    // wrong hyphens
+		"0102030-40506-0708-090a-0b0c0d0e0f10",  // misplaced hyphen
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		// Property 1: Parse never panics for any input (the f.Fuzz body itself
+		// running to completion proves no panic occurred).
+		got, err := Parse(s)
+		if err != nil {
+			return
+		}
+		// Property 2: a successful parse normalizes — re-parsing its canonical
+		// String must succeed and yield the identical value.
+		reparsed, err := Parse(got.String())
+		if err != nil {
+			t.Fatalf("Parse(%q) accepted but Parse(String()=%q) failed: %v", s, got.String(), err)
+		}
+		if reparsed != got {
+			t.Fatalf("normalization round-trip mismatch: Parse(%q)=%v, reparsed=%v", s, got, reparsed)
+		}
+	})
 }
