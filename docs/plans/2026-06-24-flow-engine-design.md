@@ -363,7 +363,7 @@ func (r *Runner[S]) GraphVersion() string                                       
 type Result[S any] struct {
     Run        GraphRunState // ids, status, step, revision, timestamps (§4.1)
     State      S             // output state (final, or last-checkpointed on interrupt)
-    Interrupts []Interrupt   // per-vertex pauses (§9.7) — set when paused; mutually exclusive with Halt
+    Interrupts []Interruption // per-vertex pauses (§9.7) — set when paused; mutually exclusive with Halt
     Halt       *Halt         // run-level routing/structural halt (§9.8) — set instead of Interrupts
 }
 
@@ -524,10 +524,14 @@ func StatefulInterrupt(ctx context.Context, info, continuation any) error // pau
 func ResumePayload[T any](ctx context.Context) (T, bool)                  // typed read of Resume() payload
 func InterruptState[T any](ctx context.Context) (T, bool)                 // typed read of StatefulInterrupt continuation
 
-type InterruptKind int
-const ( Awaiting InterruptKind = iota; Errored )
+// InterruptKind (Awaiting | Errored) is defined once with the durable checkpoint
+// types (§10.1) and reused here.
 
-type Interrupt struct {
+// Interruption is the per-vertex pause surfaced in Result.Interrupts and OnInterrupt.
+// The trigger above is the func Interrupt; a func and a type cannot share a name in
+// Go, so the surfaced record is named Interruption — the in-memory counterpart of the
+// durable InterruptRecord (§10.1).
+type Interruption struct {
     GraphRunID GraphRunID
     Vertex     VertexID
     Kind       InterruptKind
@@ -571,7 +575,7 @@ type Hooks struct {
     OnEdge         func(ctx context.Context, from, to VertexID, run GraphRunState) // every traversed edge (incl. each conditional pick); also durably in Checkpoint.Routes
     OnStep         func(ctx context.Context, run GraphRunState, activated int)      // step-level (run.Step) — no single vertex, so run-level context not RunInfo
     OnCheckpoint   func(ctx context.Context, id GraphRunID, rev uint64, step StepID)
-    OnInterrupt    func(ctx context.Context, iv Interrupt) // fired ONCE PER paused vertex — plural interrupts in one step ⇒ multiple calls
+    OnInterrupt    func(ctx context.Context, iv Interruption) // fired ONCE PER paused vertex — plural interrupts in one step ⇒ multiple calls
     OnHalt         func(ctx context.Context, h Halt)       // run-level routing/structural halt (§9.8) — kind + cause
 }
 // Registered via WithHooks(h) (repeatable).
