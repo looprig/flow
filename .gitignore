@@ -1,0 +1,23 @@
+# Compiled binaries / objects
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.o
+*.a
+
+# Test binaries
+*.test
+
+# Coverage output
+*.out
+coverage.*
+
+# Profiling output
+*.prof
+
+# Editor / IDE / OS
+.idea/
+.vscode/
+.DS_Store
