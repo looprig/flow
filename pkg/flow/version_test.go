@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/ciram-co/flow/pkg/uuid"
 )
 
 // This file tests the GraphVersion compatibility fingerprint and the GraphID()/
@@ -412,5 +414,148 @@ func TestGraphIDAccessor(t *testing.T) {
 	}
 	if c := strings.Count(gv, ":"); c != 1 {
 		t.Errorf("GraphVersion() %q has %d colons, want 1", gv, c)
+	}
+}
+
+// pinnedVID returns a VertexID parsed from a fixed canonical UUID literal, so the
+// underlying bytes (and therefore the canonical String() form) are deterministic
+// across machines — required for the golden-bytes assertion below.
+func pinnedVID(s string) VertexID { return VertexID(uuid.MustParse(s)) }
+
+// TestCanonicalFormGolden pins the EXACT byte layout of canonicalForm (white-box,
+// package flow): section order (V/E/C/X/R), the per-section tag, the "->","?","!"
+// entry tags, the "," Targets separator, the "\n" entry separator, and the "\f"
+// section separator. A refactor that changes any of these — e.g. swapping "\f"
+// for "\n" — alters the resume key silently and is caught here immediately.
+func TestCanonicalFormGolden(t *testing.T) {
+	t.Parallel()
+
+	entry := pinnedVID("11111111-1111-1111-1111-111111111111")
+	a := pinnedVID("22222222-2222-2222-2222-222222222222")
+	finish := pinnedVID("33333333-3333-3333-3333-333333333333")
+
+	g := NewGraph[st](GraphID{})
+	addV(t, g, entry, WithErrorRoute[st](a, recordReducer))
+	addV(t, g, a)
+	addV(t, g, finish)
+	if err := g.AddEdge(entry, a); err != nil {
+		t.Fatalf("AddEdge(entry,a): %v", err)
+	}
+	// Targets declared {finish, entry}; the canonical form must sort them to
+	// entry,finish (1111…,3333…), independent of declaration order.
+	if err := g.AddConditionalEdge(a, Condition[st]{
+		Targets: []VertexID{finish, entry},
+		Pick:    func(_ context.Context, _ st) ([]VertexID, error) { return []VertexID{finish}, nil },
+	}); err != nil {
+		t.Fatalf("AddConditionalEdge(a): %v", err)
+	}
+
+	want := "V\n" +
+		"11111111-1111-1111-1111-111111111111\n" +
+		"22222222-2222-2222-2222-222222222222\n" +
+		"33333333-3333-3333-3333-333333333333" +
+		"\fE\n" +
+		"11111111-1111-1111-1111-111111111111->22222222-2222-2222-2222-222222222222" +
+		"\fC\n" +
+		"22222222-2222-2222-2222-222222222222?11111111-1111-1111-1111-111111111111,33333333-3333-3333-3333-333333333333" +
+		"\fX\n" +
+		"11111111-1111-1111-1111-111111111111!22222222-2222-2222-2222-222222222222" +
+		"\fR\n" +
+		"11111111-1111-1111-1111-111111111111\n" +
+		"33333333-3333-3333-3333-333333333333"
+
+	if got := string(canonicalForm(g, entry, finish)); got != want {
+		t.Errorf("canonicalForm mismatch:\n got = %q\nwant = %q", got, want)
+	}
+}
+
+// TestGraphVersionStaticVsConditionalDistinct proves a static edge a→b and a
+// conditional edge from a with Targets {b} hash DIFFERENTLY: the "a->b" (E) and
+// "a?b" (C) sections live in distinct, tagged sections and cannot alias, so the
+// two routing kinds are never confused on resume.
+func TestGraphVersionStaticVsConditionalDistinct(t *testing.T) {
+	t.Parallel()
+
+	entry, a, b := vID(1), vID(2), vID(3)
+
+	// Static: entry->a (so a is reachable) and a->b (the edge under test).
+	static := NewGraph[st](GraphID{})
+	addV(t, static, entry)
+	addV(t, static, a)
+	addV(t, static, b)
+	if err := static.AddEdge(entry, a); err != nil {
+		t.Fatalf("AddEdge(entry,a): %v", err)
+	}
+	if err := static.AddEdge(a, b); err != nil {
+		t.Fatalf("AddEdge(a,b): %v", err)
+	}
+	rStatic, err := static.Compile(entry, b)
+	if err != nil {
+		t.Fatalf("Compile(static): %v", err)
+	}
+
+	// Conditional: entry->a, then a?{b} instead of a->b. Same vertex set + roles.
+	cond := NewGraph[st](GraphID{})
+	addV(t, cond, entry)
+	addV(t, cond, a)
+	addV(t, cond, b)
+	if err := cond.AddEdge(entry, a); err != nil {
+		t.Fatalf("AddEdge(entry,a): %v", err)
+	}
+	if err := cond.AddConditionalEdge(a, Condition[st]{
+		Targets: []VertexID{b},
+		Pick:    func(_ context.Context, _ st) ([]VertexID, error) { return []VertexID{b}, nil },
+	}); err != nil {
+		t.Fatalf("AddConditionalEdge(a): %v", err)
+	}
+	rCond, err := cond.Compile(entry, b)
+	if err != nil {
+		t.Fatalf("Compile(cond): %v", err)
+	}
+
+	if rStatic.GraphVersion() == rCond.GraphVersion() {
+		t.Error("static a->b and conditional a?{b} produced the same GraphVersion; sections alias")
+	}
+}
+
+// TestGraphVersionEdgeDirectionality proves edge endpoints are NOT sorted within
+// an edge: with the SAME vertices and the SAME entry/finish roles, a graph with
+// edge a→b and a graph with edge b→a hash DIFFERENTLY. entry fans out to both a
+// and b (so both are reachable and finish is fixed regardless of the flipped
+// edge), isolating the one reversed edge as the only difference.
+func TestGraphVersionEdgeDirectionality(t *testing.T) {
+	t.Parallel()
+
+	entry, a, b, finish := vID(1), vID(2), vID(3), vID(4)
+
+	build := func(reverse bool) *Runner[st] {
+		g := NewGraph[st](GraphID{})
+		addV(t, g, entry)
+		addV(t, g, a)
+		addV(t, g, b)
+		addV(t, g, finish)
+		// entry -> a, entry -> b, and a -> finish keep the graph valid and the
+		// roles fixed; only the edge under test (a->b vs b->a) flips.
+		for _, e := range [][2]VertexID{{entry, a}, {entry, b}, {a, finish}} {
+			if err := g.AddEdge(e[0], e[1]); err != nil {
+				t.Fatalf("AddEdge: %v", err)
+			}
+		}
+		under := [2]VertexID{a, b}
+		if reverse {
+			under = [2]VertexID{b, a}
+		}
+		if err := g.AddEdge(under[0], under[1]); err != nil {
+			t.Fatalf("AddEdge(under test): %v", err)
+		}
+		r, err := g.Compile(entry, finish)
+		if err != nil {
+			t.Fatalf("Compile(reverse=%v): %v", reverse, err)
+		}
+		return r
+	}
+
+	if build(false).GraphVersion() == build(true).GraphVersion() {
+		t.Error("a->b and b->a produced the same GraphVersion; edge directionality lost")
 	}
 }

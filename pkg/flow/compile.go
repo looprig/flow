@@ -181,6 +181,12 @@ func (g *Graph[S]) checkReachable(entry VertexID) error {
 // routable topology: static out-edges, conditional Targets, and the error-route
 // handler. Endpoint existence is validated separately (validateEndpoints), so by
 // the time reachability runs every returned id is a known vertex.
+//
+// The error-route lookup's `ok` is a DEFENSIVE guard: in the current call graph
+// successors only runs over ids that are graph vertices (BFS seeds with entry,
+// validated to exist, and only ever enqueues known vertices), so the lookup never
+// misses today. It is kept so a future caller that passes an unknown id gets a
+// safe nil-route skip rather than a map-miss panic, not because it can trip now.
 func (g *Graph[S]) successors(id VertexID) []VertexID {
 	var next []VertexID
 	next = append(next, g.edges[id]...)
