@@ -22,8 +22,8 @@
   4. Run the test; confirm it passes.
   5. Commit (message given per task).
 - **Every test is table-driven, every subtest calls `t.Parallel()`, every run uses `-race`** (CLAUDE.md). Each table must cover: happy path, boundary (zero/empty/single/max), error cases, and the domain edges listed in the task.
-- **Workspace:** A parent `go.work` at `/Users/ipotter/code/go.work` does not list `./flows`, so **all `go` commands in this repo must run with `GOWORK=off`** (the standing decision — flows is consumed as a standalone module). Prefix every `go`/`gofmt` invocation accordingly.
-- **Standard verification command** (run before every commit): `GOWORK=off gofmt -l . && GOWORK=off CGO_ENABLED=0 go build -trimpath ./... && GOWORK=off go test -race ./...`. Milestones that add fuzz/integration/static-analysis name the extra command explicitly.
+- **Workspace & vendoring:** A parent `go.work` at `/Users/ipotter/code/go.work` does not list `./flows`, so **all `go`/`gofmt` commands in this repo must run with `GOWORK=off`** (flows is a standalone module). The repo is also **vendored** (looprig pattern, Task 0.2): the `Makefile` exports `GOWORK := off` and `GOFLAGS := -mod=vendor`, so prefer the `make` targets. For ad-hoc/targeted commands, prefix with `GOWORK=off GOFLAGS=-mod=vendor` (e.g. running one test).
+- **Standard verification** (before every commit): run **`make check`** (= `fmt-check` + `vet` + `staticcheck` + `gosec` + `go mod verify` + `govulncheck` + `build` + `race-test`). For a targeted test loop: `GOWORK=off GOFLAGS=-mod=vendor go test -race ./pkg/<pkg>/ -run TestName -v`. Milestones that add fuzz/integration name the extra command explicitly.
 - **Required skills while executing:** `superpowers:test-driven-development` (every task), `superpowers:systematic-debugging` (any failure), `superpowers:requesting-code-review` (end of each phase), `superpowers:verification-before-completion` (before any "done" claim).
 - **Module path:** `github.com/ciram-co/flow`; engine package import path `github.com/ciram-co/flow/pkg/flow` (§1). All paths below are relative to repo root `/Users/ipotter/code/flows`.
 
@@ -51,21 +51,26 @@
 
 **Commit:** `chore: initialize flow module, package skeleton, and gitignore`
 
-### Task 0.2: Dev-tool static-analysis chain (no runtime deps)
+### Task 0.2: Dev-tool static-analysis chain (mirror looprig's pattern)
+
+> **As built (decided during execution):** mirror the sibling project `looprig`'s dev-tooling notion — Go's native **`tool` directive** (Go 1.24+) instead of a `tools.go` blank-import file, **`go tool <name>`** invocation, and a committed **vendored** tree (`-mod=vendor`) for offline/reproducible/auditable builds. This keeps the library's *runtime* posture at zero third-party deps while pinning the dev tools.
 
 **Files:**
-- Create: `tools/tools.go` (build-tagged `//go:build tools`, blank-imports the three sanctioned dev tools so `go.mod` pins them without linking them into the library)
-- Create: `Makefile` (or `scripts/check.sh`) with targets: `fmt`, `vet`, `build`, `test` (`-race`), `staticcheck`, `gosec`, `vuln` (`govulncheck`), `fuzz`, and `check` (runs all)
+- Modify: `go.mod` — add the `tool ( … )` directive (via `go get -tool`); the three tools + their transitive closure land as `// indirect` requires.
+- Create: `vendor/` — committed (`go mod vendor`); contains dev-tool source only. `.gitignore` gets a `!/vendor/**` negation so global ignores can't drop vendored files.
+- Create: `Makefile` mirroring looprig — `export GOWORK := off` + `export GOFLAGS := -mod=vendor`, a `GO_DIRS := $(shell GOWORK=off go list -f '{{.Dir}}' ./...)` line (the inline `GOWORK=off` is REQUIRED: `make`'s `export` does not reach parse-time `$(shell)`, and flows is not in the parent go.work), and targets `test`/`fmt`/`fmt-check`/`lint`/`vuln`/`secure`/`fuzz`/`build`/`check`. Tools invoked via `go tool staticcheck`/`go tool gosec`/`go tool govulncheck`; `gosec` scoped to `$(GO_DIRS)` (not module-aware; would otherwise descend into the future nested `pkg/nats` module).
 
 **Steps:**
-1. Add the three sanctioned dev/tool deps from CLAUDE.md to `tools/tools.go`: `honnef.co/go/tools/cmd/staticcheck`, `github.com/securego/gosec/v2/cmd/gosec`, `golang.org/x/vuln/cmd/govulncheck`. These are **dev/tool-only** and already sanctioned in CLAUDE.md — no new approval needed.
-2. `go mod tidy`; confirm the three appear under an `// indirect`/tools grouping and **no runtime dep** is added to the core module.
-3. Wire `make check` to run: `gofmt -l .`, `go vet ./...`, `staticcheck ./...`, `gosec ./...`, `govulncheck ./...`, `CGO_ENABLED=0 go build -trimpath ./...`, `go test -race ./...`.
-4. Run `make check` on the empty skeleton — passes clean.
+1. `GOWORK=off go get -tool honnef.co/go/tools/cmd/staticcheck github.com/securego/gosec/v2/cmd/gosec golang.org/x/vuln/cmd/govulncheck` — these are **dev/tool-only** and already sanctioned in CLAUDE.md (no new approval). Then `GOWORK=off go mod tidy`.
+2. `GOWORK=off go mod vendor`; confirm the library still imports **zero third-party runtime packages** (`GOWORK=off GOFLAGS=-mod=vendor go list -deps ./pkg/... | grep -E '\.(com|org|net|io|dev)/' | grep -v ciram-co/flow` is empty).
+3. Wire `make check` = `secure` (`fmt-check` + `vet` + `staticcheck` + `gosec`) + `vuln` (`go mod verify` + `govulncheck`) + `build` + `test` (`-race`).
+4. Run `make check` on the skeleton — passes clean.
 
-**Commit:** `chore: wire staticcheck/gosec/govulncheck dev tooling and make check`
+**Commit:** `chore: wire dev tooling via go tool directive + vendoring (looprig pattern)`
 
-**Phase 0 gate:** `make check` is green on an empty module. Request a quick review of `go.mod` to confirm zero runtime dependencies (`go mod graph` shows only tool deps).
+> Note: `go mod tidy` bumps the `go` directive to `1.25.0` (a tool's transitive minimum), and `vendor/` is ~37 MB / ~2356 files. Both are accepted consequences of the looprig parity choice; vendoring is reversible (`git rm -r vendor`, drop `-mod=vendor`) if a leaner repo is later preferred.
+
+**Phase 0 gate:** `make check` is green. `go list -deps ./pkg/...` confirms zero third-party **runtime** dependencies (tool deps live under the `tool` directive / `vendor/`, never imported by the library).
 
 ---
 
