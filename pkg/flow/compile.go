@@ -23,22 +23,35 @@ package flow
 // DuplicateVertexError (an add-time error, §12.4), so duplicates are structurally
 // impossible by the time Compile runs.
 //
-// SCOPE. This is validation + a minimal Runner skeleton only. The GraphVersion
-// fingerprint and the WithStore/WithVersion CompileOptions (§8.1) are Task 3.4;
-// store/hooks/concurrency and Run/Resume/Status are later phases. compileConfig
-// is intentionally empty today so the Compile signature is stable when those land.
+// SCOPE. This is validation + the GraphVersion fingerprint (§8.1) + a minimal
+// Runner skeleton. The WithStore CompileOption, store/hooks/concurrency, and
+// Run/Resume/Status are later phases. compileConfig is intentionally empty today
+// so the Compile signature is stable when those land.
 
 // Runner is the immutable, validated form of a Graph[S], produced by Compile
-// (§8, §9). It is safe to reuse across concurrent runs. Today it holds only the
-// validated graph and the entry/finish roles; later phases extend it with the
-// GraphVersion fingerprint (Task 3.4) and the store, hooks, concurrency, maxSteps,
-// and granularity needed to actually Run (§9). It deliberately exposes no methods
-// yet — execution and the control surface are later phases.
+// (§8, §9). It is safe to reuse across concurrent runs. Today it holds the
+// validated graph, the entry/finish roles, and the GraphVersion fingerprint
+// (§8.1); later phases extend it with the store, hooks, concurrency, maxSteps,
+// and granularity needed to actually Run (§9). Its only methods are the §8.1
+// accessors (GraphID/GraphVersion); execution and the rest of the control surface
+// are later phases.
 type Runner[S any] struct {
-	graph  *Graph[S]
-	entry  VertexID
-	finish VertexID
+	graph   *Graph[S]
+	entry   VertexID
+	finish  VertexID
+	version string // GraphVersion fingerprint (§8.1), computed at Compile
 }
+
+// GraphID returns the runner's stable definition identity (§3, §8.1): the pinned
+// GraphID of the compiled graph. It is identity, NOT the compatibility key — use
+// GraphVersion for resume compatibility.
+func (r *Runner[S]) GraphID() GraphID { return r.graph.id }
+
+// GraphVersion returns the compatibility fingerprint computed at Compile (§8.1):
+// a sha256 of the graph's topology plus a ":userVersion" suffix. Resume compares
+// it to the checkpoint's; any difference is a GraphVersionMismatchError, so a
+// changed graph cannot resume an old checkpoint.
+func (r *Runner[S]) GraphVersion() string { return r.version }
 
 // compileConfig is the resolved Compile-time configuration assembled from
 // CompileOptions (§8). It is EMPTY today: the WithStore/WithVersion options that
@@ -78,7 +91,14 @@ func (g *Graph[S]) Compile(entry, finish VertexID, opts ...CompileOption) (*Runn
 		return nil, err
 	}
 
-	return &Runner[S]{graph: g, entry: entry, finish: finish}, nil
+	// Validation passed: stamp the §8.1 compatibility fingerprint so a later
+	// Resume against a changed graph fails loudly (GraphVersionMismatchError).
+	return &Runner[S]{
+		graph:   g,
+		entry:   entry,
+		finish:  finish,
+		version: graphVersion(g, entry, finish),
+	}, nil
 }
 
 // validateEndpoints checks that every topology endpoint references a known vertex
