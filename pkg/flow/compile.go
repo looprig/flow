@@ -24,22 +24,29 @@ package flow
 // impossible by the time Compile runs.
 //
 // SCOPE. This is validation + the GraphVersion fingerprint (§8.1) + a minimal
-// Runner skeleton. The WithStore CompileOption, store/hooks/concurrency, and
-// Run/Resume/Status are later phases. compileConfig is intentionally empty today
-// so the Compile signature is stable when those land.
+// Runner skeleton carrying its single CheckpointStore (§9). The hooks,
+// concurrency, maxSteps, granularity options and Run/Resume/Status are later
+// phases.
 
 // Runner is the immutable, validated form of a Graph[S], produced by Compile
 // (§8, §9). It is safe to reuse across concurrent runs. Today it holds the
-// validated graph, the entry/finish roles, and the GraphVersion fingerprint
-// (§8.1); later phases extend it with the store, hooks, concurrency, maxSteps,
-// and granularity needed to actually Run (§9). Its only methods are the §8.1
-// accessors (GraphID/GraphVersion); execution and the rest of the control surface
-// are later phases.
+// validated graph, the entry/finish roles, the GraphVersion fingerprint (§8.1),
+// and the single CheckpointStore set at Compile (§9); later phases extend it with
+// hooks, concurrency, maxSteps, and granularity needed to actually Run (§9). Its
+// only methods are the §8.1 accessors (GraphID/GraphVersion); execution and the
+// rest of the control surface are later phases.
+//
+// The store is the INTERFACE (CheckpointStore), not a concrete type (dependency
+// inversion): the default MemStore is wired at Compile, the composition point, so
+// the Runner never depends on a specific backend. Per §9 it is fixed at Compile —
+// ALL operations (Run, Resume, Status, Get) use this one store; there is no
+// per-run override.
 type Runner[S any] struct {
 	graph   *Graph[S]
 	entry   VertexID
 	finish  VertexID
-	version string // GraphVersion fingerprint (§8.1), computed at Compile
+	version string          // GraphVersion fingerprint (§8.1), computed at Compile
+	store   CheckpointStore // the single durable store for all ops (§9)
 }
 
 // GraphID returns the runner's stable definition identity (§3, §8.1): the pinned
@@ -54,21 +61,34 @@ func (r *Runner[S]) GraphID() GraphID { return r.graph.id }
 func (r *Runner[S]) GraphVersion() string { return r.version }
 
 // compileConfig is the resolved Compile-time configuration assembled from
-// CompileOptions (§8). It is EMPTY today: the WithStore/WithVersion options that
-// populate it are Task 3.4. It exists now so Compile can accept and apply opts,
-// keeping the public signature stable when those options are added.
-type compileConfig struct{}
+// CompileOptions (§8). store holds the optional caller-supplied CheckpointStore;
+// a nil store (option unset, or WithStore(nil)) means "use the default MemStore",
+// resolved in Compile. Later phases add hooks/concurrency/maxSteps/granularity
+// fields here.
+type compileConfig struct {
+	store CheckpointStore // nil => Compile wires a default MemStore (§9)
+}
 
 // CompileOption configures Compile (§8). It is non-generic so the same option
-// value works for any state type S. No options exist yet (§8.1, Task 3.4); the
-// type is defined now to lock the Compile signature.
+// value works for any state type S, since the store is fixed at Compile (§9) and
+// not parameterized by S.
 type CompileOption func(*compileConfig)
 
+// WithStore pins the CheckpointStore the Runner uses for ALL operations — Run,
+// Resume, Status, Get (§9). The store is fixed at Compile; there is no per-run
+// override. Passing nil is not an error: Compile falls back to a fresh default
+// MemStore, so a zero/nil store never reaches the Runner (fail safe).
+func WithStore(s CheckpointStore) CompileOption {
+	return func(c *compileConfig) { c.store = s }
+}
+
 // Compile validates the whole graph (§8) and, on success, returns an immutable
-// *Runner[S] bound to entry and finish. It runs every §8 check in the documented
-// first-error order (see the file comment) and returns the FIRST typed violation;
-// on success the returned Runner is non-nil. Options are accepted and applied
-// (none exist yet — Task 3.4); a malformed graph fails secure with no Runner.
+// *Runner[S] bound to entry and finish and to a single CheckpointStore (§9). It
+// runs every §8 check in the documented first-error order (see the file comment)
+// and returns the FIRST typed violation; on success the returned Runner is
+// non-nil. The store comes from WithStore if supplied non-nil, else a fresh
+// default MemStore (the default is wired here, the composition point). A malformed
+// graph fails secure with no Runner.
 func (g *Graph[S]) Compile(entry, finish VertexID, opts ...CompileOption) (*Runner[S], error) {
 	cfg := compileConfig{}
 	for _, opt := range opts {
@@ -91,13 +111,21 @@ func (g *Graph[S]) Compile(entry, finish VertexID, opts ...CompileOption) (*Runn
 		return nil, err
 	}
 
-	// Validation passed: stamp the §8.1 compatibility fingerprint so a later
-	// Resume against a changed graph fails loudly (GraphVersionMismatchError).
+	// Validation passed. Resolve the single store (§9): the caller's via WithStore
+	// if non-nil, else a fresh default MemStore — wired here, the composition point,
+	// so the Runner depends only on the CheckpointStore interface. Stamp the §8.1
+	// fingerprint so a later Resume against a changed graph fails loudly
+	// (GraphVersionMismatchError).
+	store := cfg.store
+	if store == nil {
+		store = NewMemStore()
+	}
 	return &Runner[S]{
 		graph:   g,
 		entry:   entry,
 		finish:  finish,
 		version: graphVersion(g, entry, finish),
+		store:   store,
 	}, nil
 }
 

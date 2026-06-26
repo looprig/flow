@@ -422,3 +422,91 @@ func TestCompileOptionApplied(t *testing.T) {
 		t.Error("CompileOption was not applied")
 	}
 }
+
+// TestCompileDefaultStore proves Compile with no options wires an internal
+// default store (§9): the runner carries a non-nil CheckpointStore that is a
+// *MemStore. The store is fixed at Compile and used by every later operation.
+func TestCompileDefaultStore(t *testing.T) {
+	t.Parallel()
+
+	entry := vID(1)
+	g := NewGraph[st](GraphID{})
+	addV(t, g, entry)
+
+	r, err := g.Compile(entry, entry)
+	if err != nil {
+		t.Fatalf("Compile() error = %v, want nil", err)
+	}
+	if r.store == nil {
+		t.Fatal("Runner.store is nil, want a default *MemStore")
+	}
+	if _, ok := r.store.(*MemStore); !ok {
+		t.Errorf("Runner.store is %T, want *MemStore", r.store)
+	}
+}
+
+// TestCompileWithStore proves WithStore pins the caller's CheckpointStore onto
+// the runner (§9): r.store is the SAME instance passed to WithStore, not a copy
+// or a default. WithStore(nil) falls back to the default and is covered by
+// TestCompileWithNilStoreFallsBack.
+func TestCompileWithStore(t *testing.T) {
+	t.Parallel()
+
+	entry := vID(1)
+	g := NewGraph[st](GraphID{})
+	addV(t, g, entry)
+
+	s := NewMemStore()
+	r, err := g.Compile(entry, entry, WithStore(s))
+	if err != nil {
+		t.Fatalf("Compile() error = %v, want nil", err)
+	}
+	if r.store != s {
+		t.Errorf("Runner.store = %p, want the WithStore instance %p", r.store, s)
+	}
+}
+
+// TestCompileWithNilStoreFallsBack proves WithStore(nil) does NOT error and does
+// NOT leave a nil store: Compile resolves a nil configured store to a fresh
+// default *MemStore (fail-safe default, no per-run/zero-value surprise).
+func TestCompileWithNilStoreFallsBack(t *testing.T) {
+	t.Parallel()
+
+	entry := vID(1)
+	g := NewGraph[st](GraphID{})
+	addV(t, g, entry)
+
+	r, err := g.Compile(entry, entry, WithStore(nil))
+	if err != nil {
+		t.Fatalf("Compile() error = %v, want nil", err)
+	}
+	if r.store == nil {
+		t.Fatal("Runner.store is nil, want default *MemStore after WithStore(nil)")
+	}
+	if _, ok := r.store.(*MemStore); !ok {
+		t.Errorf("Runner.store is %T, want *MemStore", r.store)
+	}
+}
+
+// TestCompileDefaultStoresAreDistinct proves each no-option Compile gets its OWN
+// internal MemStore, never a shared global: two runners' default stores must be
+// different instances so runs on one runner cannot leak into another.
+func TestCompileDefaultStoresAreDistinct(t *testing.T) {
+	t.Parallel()
+
+	entry := vID(1)
+	g := NewGraph[st](GraphID{})
+	addV(t, g, entry)
+
+	r1, err := g.Compile(entry, entry)
+	if err != nil {
+		t.Fatalf("Compile() #1 error = %v, want nil", err)
+	}
+	r2, err := g.Compile(entry, entry)
+	if err != nil {
+		t.Fatalf("Compile() #2 error = %v, want nil", err)
+	}
+	if r1.store == r2.store {
+		t.Errorf("default stores are the same instance %p, want distinct per-runner stores", r1.store)
+	}
+}
