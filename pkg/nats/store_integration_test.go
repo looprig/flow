@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // This suite holds the JetStream-backed Store to the SAME CheckpointStore
@@ -29,6 +31,16 @@ import (
 // testStore boots a shared embedded server once per top-level test and returns a
 // Store over an in-process connection, registering cleanup.
 func testStore(t *testing.T) *Store {
+	t.Helper()
+	store, _ := testStoreWithConn(t)
+	return store
+}
+
+// testStoreWithConn is like testStore but also returns the underlying connection,
+// so corrupt-store tests can publish hand-crafted bad messages straight onto a
+// run's subject (bypassing the Store's invariants) and then assert the Store's
+// defensive read behavior.
+func testStoreWithConn(t *testing.T) (*Store, *nats.Conn) {
 	t.Helper()
 	srv, err := Embedded(WithStoreDir(t.TempDir()), WithReadyTimeout(15*time.Second))
 	if err != nil {
@@ -48,7 +60,28 @@ func testStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
-	return store
+	return store, nc
+}
+
+// publishRaw puts arbitrary bytes onto a run's checkpoint subject via JetStream,
+// optionally carrying a Flow-Revision header. It is the test's way to plant
+// corruption that the Store must defend against on read.
+func publishRaw(t *testing.T, nc *nats.Conn, id flow.GraphRunID, data []byte, revHeader string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New() error = %v", err)
+	}
+	subj := subjectPrefix + id.String()
+	msg := &nats.Msg{Subject: subj, Data: data}
+	if revHeader != "" {
+		msg.Header = nats.Header{revisionHeader: []string{revHeader}}
+	}
+	if _, err := js.PublishMsg(ctx, msg); err != nil {
+		t.Fatalf("publishRaw PublishMsg() error = %v", err)
+	}
 }
 
 func runIDForTest(t *testing.T) flow.GraphRunID {
@@ -544,6 +577,254 @@ func TestStoreMaxMsgSizeEnforced(t *testing.T) {
 	var se *flow.StoreError
 	if !errors.As(err, &se) {
 		t.Fatalf("Append() of oversized checkpoint error = %v, want *flow.StoreError", err)
+	}
+}
+
+// TestStoreCorruptBodyOnRead plants an undecodable body directly on a run's
+// subject and asserts BOTH Latest and History fail with a typed *flow.StoreError
+// wrapping a *flow.CheckpointDecodeError (untrusted stored bytes, §10.4).
+func TestStoreCorruptBodyOnRead(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		op   string
+	}{
+		{name: "Latest surfaces decode failure", op: "Latest"},
+		{name: "History surfaces decode failure", op: "History"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store, nc := testStoreWithConn(t)
+			ctx := context.Background()
+			id := runIDForTest(t)
+			// A revision-0 header so History's count derivation does not short out
+			// before it ever decodes the (corrupt) body.
+			publishRaw(t, nc, id, []byte(`{not valid json`), "0")
+
+			var err error
+			switch tt.op {
+			case "Latest":
+				_, err = store.Latest(ctx, id)
+			case "History":
+				_, err = store.History(ctx, id)
+			}
+			var se *flow.StoreError
+			if !errors.As(err, &se) {
+				t.Fatalf("%s on corrupt body error = %v, want *flow.StoreError", tt.op, err)
+			}
+			if se.Op != tt.op {
+				t.Errorf("se.Op = %q, want %q", se.Op, tt.op)
+			}
+			var de *flow.CheckpointDecodeError
+			if !errors.As(err, &de) {
+				t.Fatalf("%s on corrupt body error = %v, want it to wrap *flow.CheckpointDecodeError", tt.op, err)
+			}
+		})
+	}
+}
+
+// TestStoreForeignRunIDOnRead plants a well-formed checkpoint whose embedded run
+// id belongs to a DIFFERENT run on the subject of id, and asserts Latest/History
+// reject it as a *flow.GraphRunMismatchError (misrouted/corrupt store, §10.4).
+func TestStoreForeignRunIDOnRead(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		op   string
+	}{
+		{name: "Latest detects foreign run id", op: "Latest"},
+		{name: "History detects foreign run id", op: "History"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store, nc := testStoreWithConn(t)
+			ctx := context.Background()
+			id := runIDForTest(t)
+			foreign := runIDForTest(t)
+			// A valid checkpoint body, but its Run.GraphRunID is `foreign`, planted on
+			// id's subject. Revision 0 so History attempts to read it.
+			body, err := json.Marshal(cpForTest(foreign, 0))
+			if err != nil {
+				t.Fatalf("marshal foreign cp error = %v", err)
+			}
+			publishRaw(t, nc, id, body, "0")
+
+			switch tt.op {
+			case "Latest":
+				_, err = store.Latest(ctx, id)
+			case "History":
+				_, err = store.History(ctx, id)
+			}
+			var mm *flow.GraphRunMismatchError
+			if !errors.As(err, &mm) {
+				t.Fatalf("%s on foreign run id error = %v, want *flow.GraphRunMismatchError", tt.op, err)
+			}
+			if mm.Requested != id || mm.Actual != foreign {
+				t.Errorf("mismatch = {Requested:%v Actual:%v}, want {Requested:%v Actual:%v}", mm.Requested, mm.Actual, id, foreign)
+			}
+			var se *flow.StoreError
+			if !errors.As(err, &se) {
+				t.Errorf("%s on foreign run id error = %v, want it wrapped in *flow.StoreError", tt.op, err)
+			}
+		})
+	}
+}
+
+// TestStoreHistoryUnderReportingHeaderDefended is the High-1 regression test: a
+// run with TWO committed revisions whose LAST message carries a LYING
+// Flow-Revision header ("0", under-reporting the real revision 1). A backend that
+// trusted the header would compute want=1 and silently return a TRUNCATED history
+// of just revision 0. History must instead derive its count from the body and/or
+// drain-check, so it either returns the full 2-revision history or fails with a
+// corrupt-store error — but NEVER a silent prefix.
+func TestStoreHistoryUnderReportingHeaderDefended(t *testing.T) {
+	t.Parallel()
+	store, nc := testStoreWithConn(t)
+	ctx := context.Background()
+	id := runIDForTest(t)
+
+	// Commit revision 0 normally.
+	if err := store.Append(ctx, cpForTest(id, 0)); err != nil {
+		t.Fatalf("Append(rev=0) error = %v", err)
+	}
+	// Plant revision 1 with a LYING header claiming revision 0. Body is honest
+	// (revision 1) so the server's per-subject append accepts it as the 2nd msg.
+	body, err := json.Marshal(cpForTest(id, 1))
+	if err != nil {
+		t.Fatalf("marshal rev1 error = %v", err)
+	}
+	publishRaw(t, nc, id, body, "0") // header lies: says rev 0
+
+	hist, err := store.History(ctx, id)
+	if err != nil {
+		// Acceptable: a corrupt-store error. What is NOT acceptable is a silent
+		// truncated success — that is asserted in the success branch below.
+		var se *flow.StoreError
+		if !errors.As(err, &se) {
+			t.Fatalf("History() error = %v, want either full history or a *flow.StoreError", err)
+		}
+		return
+	}
+	if len(hist) != 2 {
+		t.Fatalf("History() silently returned %d revisions, want 2 (header under-report must NOT truncate)", len(hist))
+	}
+	for i, cp := range hist {
+		if cp.Run.Revision != uint64(i) {
+			t.Errorf("History()[%d].Run.Revision = %d, want %d", i, cp.Run.Revision, i)
+		}
+	}
+}
+
+// TestStoreTwoFirstAppendsRaceRev0 (Med-3) races TWO appends of revision 0 (the
+// empty-subject case: expectedSeq=0). Exactly one must win; the other must get a
+// *flow.RevisionConflictError. This exercises the server gate at the bootstrap
+// boundary where expectedSeq is 0.
+func TestStoreTwoFirstAppendsRaceRev0(t *testing.T) {
+	t.Parallel()
+	store := testStore(t)
+	ctx := context.Background()
+
+	const rounds = 20
+	for round := 0; round < rounds; round++ {
+		id := runIDForTest(t)
+		var (
+			start    sync.WaitGroup
+			done     sync.WaitGroup
+			wins     int32
+			conflict int32
+		)
+		start.Add(1)
+		done.Add(2)
+		for g := 0; g < 2; g++ {
+			go func() {
+				defer done.Done()
+				start.Wait()
+				err := store.Append(ctx, cpForTest(id, 0))
+				if err == nil {
+					atomic.AddInt32(&wins, 1)
+					return
+				}
+				var rc *flow.RevisionConflictError
+				if errors.As(err, &rc) {
+					atomic.AddInt32(&conflict, 1)
+					return
+				}
+				t.Errorf("unexpected Append error = %v", err)
+			}()
+		}
+		start.Done()
+		done.Wait()
+
+		if wins != 1 {
+			t.Fatalf("round %d: winners = %d, want exactly 1", round, wins)
+		}
+		if conflict != 1 {
+			t.Fatalf("round %d: conflicts = %d, want exactly 1", round, conflict)
+		}
+	}
+}
+
+// TestStoreHistoryHonorsCancelledCtx asserts History aborts promptly on a ctx that
+// is already cancelled — the High-2 fix threads ctx into Fetch so a deadline is
+// honored mid-pull, not just between rounds.
+func TestStoreHistoryHonorsCancelledCtx(t *testing.T) {
+	t.Parallel()
+	store := testStore(t)
+	id := runIDForTest(t)
+	if err := store.Append(context.Background(), cpForTest(id, 0)); err != nil {
+		t.Fatalf("seed Append error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := store.History(ctx, id)
+	var se *flow.StoreError
+	if !errors.As(err, &se) {
+		t.Fatalf("History() with cancelled ctx error = %v, want *flow.StoreError", err)
+	}
+	if se.Op != "History" {
+		t.Errorf("se.Op = %q, want \"History\"", se.Op)
+	}
+}
+
+// TestStoreHistoryDeletesConsumer (High-3) asserts History does NOT leak the
+// ephemeral ordered consumer it creates: after several History calls the stream
+// has zero consumers (each call deletes its own on exit, rather than leaving it to
+// time out after minutes).
+func TestStoreHistoryDeletesConsumer(t *testing.T) {
+	t.Parallel()
+	store, nc := testStoreWithConn(t)
+	ctx := context.Background()
+	id := runIDForTest(t)
+	for rev := uint64(0); rev < 3; rev++ {
+		if err := store.Append(ctx, cpForTest(id, rev)); err != nil {
+			t.Fatalf("Append(rev=%d) error = %v", rev, err)
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, err := store.History(ctx, id); err != nil {
+			t.Fatalf("History() call %d error = %v", i, err)
+		}
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream.New() error = %v", err)
+	}
+	stream, err := js.Stream(ctx, defaultStreamName)
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("Stream.Info() error = %v", err)
+	}
+	if info.State.Consumers != 0 {
+		t.Errorf("stream has %d consumers after History calls, want 0 (consumer leak)", info.State.Consumers)
 	}
 }
 

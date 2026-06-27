@@ -16,9 +16,9 @@
 //
 // # What it provides (behind the SAME interfaces)
 //
-//   - Store      — a flow.CheckpointStore backed by JetStream key/value, honoring
-//     the same append-only, compare-and-append, latest-is-source-of-truth contract
-//     as flow.MemStore (§10.2).
+//   - Store      — a flow.CheckpointStore backed by a JetStream stream (one subject
+//     per run, all revisions retained), honoring the same append-only, compare-and-
+//     append, latest-is-source-of-truth contract as flow.MemStore (§10.2).
 //   - ControlPlane — a flow.ControlPlane backed by JetStream work streams with
 //     version-routed subjects, durable consumers, and per-run single-flight,
 //     honoring the same Submit/Consume/Ack/Nack contract as controlplane.Mem

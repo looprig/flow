@@ -72,6 +72,16 @@ const (
 	// messages already exist on the stream — Fetch should return them promptly, not
 	// wait for new ones — yet long enough to absorb consumer setup latency.
 	fetchWait = 5 * time.Second
+
+	// historyInactiveThreshold caps how long the server keeps the ephemeral
+	// ordered consumer History creates if (despite explicit deletion) cleanup is
+	// missed — e.g. the process dies mid-read. Without it the client defaults to 5
+	// MINUTES, leaving a server-side consumer alive that long per call.
+	historyInactiveThreshold = 30 * time.Second
+
+	// consumerDeleteTimeout bounds the best-effort consumer deletion on History's
+	// exit paths, so cleanup itself never blocks unboundedly.
+	consumerDeleteTimeout = 5 * time.Second
 )
 
 // jsWrongLastSequence is the JetStream error code for a rejected
@@ -85,7 +95,36 @@ type Store struct {
 	js         jetstream.JetStream
 	stream     jetstream.Stream
 	streamName string
+	maxMsgSize int32 // read-side size bound (independent of the stream's own limit)
 }
+
+// corruptHistoryError reports that a run's stored history is internally
+// inconsistent on read: a revision gap, a non-contiguous revision, or more
+// messages on the subject than the authoritative count expected. Each is a
+// distinct durability fault that callers can errors.As to distinguish from a
+// transient store/transport failure (CLAUDE.md: all errors typed).
+type corruptHistoryError struct{ Reason string }
+
+// Error names the corruption detected while reading a run's history.
+func (e *corruptHistoryError) Error() string {
+	return "flow/nats: corrupt checkpoint history: " + e.Reason
+}
+
+// corruptHeaderError reports that a stored message's advisory Flow-Revision
+// header is present but unparseable. It is typed (not a bare formatted string) so
+// callers can errors.As it; it wraps the parse cause.
+type corruptHeaderError struct {
+	Value string
+	Err   error
+}
+
+// Error names the bad header value and its parse cause.
+func (e *corruptHeaderError) Error() string {
+	return "flow/nats: invalid " + revisionHeader + " header " + strconv.Quote(e.Value) + ": " + e.Err.Error()
+}
+
+// Unwrap returns the parse cause so errors.Is/As can inspect it.
+func (e *corruptHeaderError) Unwrap() error { return e.Err }
 
 // storeConfig holds resolved Store options.
 type storeConfig struct {
@@ -147,7 +186,7 @@ func NewStore(ctx context.Context, nc *nats.Conn, opts ...Option) (*Store, error
 		return nil, &flow.StoreError{Op: "NewStore", Err: err}
 	}
 
-	return &Store{js: js, stream: stream, streamName: cfg.streamName}, nil
+	return &Store{js: js, stream: stream, streamName: cfg.streamName, maxMsgSize: cfg.maxMsgSize}, nil
 }
 
 // subjectFor maps a run id to its per-run subject, validating the id is non-zero
@@ -185,7 +224,14 @@ func (s *Store) Append(ctx context.Context, cp *flow.Checkpoint) error {
 	if err != nil {
 		return &flow.StoreError{Op: "Append", Err: err}
 	}
-	// Fast, precise pre-check (the server header below is the real gate).
+	// Header-trust is SAFE here (but NOT in History): expectedSeq is the stream's
+	// authoritative last.Sequence, and the server's WithExpectLastSequencePerSubject
+	// gate below — keyed on that sequence, not the revision — is the real arbiter. A
+	// lying revision header could at worst skew this client-side pre-check's
+	// Expected/Actual; it cannot let a wrong append commit. History, by contrast,
+	// must NOT trust the header because it derives a COUNT from it.
+	//
+	// Fast, precise pre-check (the server sequence gate below is the real gate).
 	if cp.Run.Revision != expectedRev {
 		return &flow.RevisionConflictError{
 			GraphRunID: cp.Run.GraphRunID,
@@ -234,7 +280,7 @@ func (s *Store) Latest(ctx context.Context, id flow.GraphRunID) (*flow.Checkpoin
 		}
 		return nil, &flow.StoreError{Op: "Latest", Err: err}
 	}
-	cp, err := decodeCheckpoint(last.Data, id)
+	cp, err := s.decodeCheckpoint(last.Data, id)
 	if err != nil {
 		return nil, &flow.StoreError{Op: "Latest", Err: err}
 	}
@@ -245,6 +291,15 @@ func (s *Store) Latest(ctx context.Context, id flow.GraphRunID) (*flow.Checkpoin
 // *flow.CheckpointNotFoundError if the run has none. It reads via an ephemeral
 // ordered consumer filtered to the run's subject, in bounded batches honoring ctx,
 // and verifies the result is contiguous 0..N (a gap ⇒ corrupt store).
+//
+// AUTHORITATIVE COUNT (High-1): the expected count comes from the BODY of the last
+// message (its Run.Revision), never from the advisory Flow-Revision header — a
+// lying header that under-reported the revision would make History read only a
+// prefix and silently return a TRUNCATED history, the worst failure for a
+// durability store. After reading exactly `want` messages, History also DRAINS the
+// subject to confirm none remain beyond `want`; extra messages mean the body
+// under-reported and the result would have been a silent prefix — a corrupt-store
+// error, not a quiet success.
 func (s *Store) History(ctx context.Context, id flow.GraphRunID) ([]*flow.Checkpoint, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, &flow.StoreError{Op: "History", Err: err}
@@ -255,7 +310,8 @@ func (s *Store) History(ctx context.Context, id flow.GraphRunID) ([]*flow.Checkp
 	}
 
 	// Determine the expected count from the highest revision; also gives the
-	// not-found short-circuit.
+	// not-found short-circuit. The count is read from the BODY (decodeCheckpoint),
+	// which also enforces the run-id match — never from the advisory header.
 	last, err := s.stream.GetLastMsgForSubject(ctx, subj)
 	if err != nil {
 		if errors.Is(err, jetstream.ErrMsgNotFound) {
@@ -263,11 +319,11 @@ func (s *Store) History(ctx context.Context, id flow.GraphRunID) ([]*flow.Checkp
 		}
 		return nil, &flow.StoreError{Op: "History", Err: err}
 	}
-	lastRev, err := revisionOf(last)
+	lastCP, err := s.decodeCheckpoint(last.Data, id)
 	if err != nil {
 		return nil, &flow.StoreError{Op: "History", Err: err}
 	}
-	want := lastRev + 1
+	want := lastCP.Run.Revision + 1
 
 	history, err := s.fetchHistory(ctx, subj, id, want)
 	if err != nil {
@@ -278,15 +334,36 @@ func (s *Store) History(ctx context.Context, id flow.GraphRunID) ([]*flow.Checkp
 
 // fetchHistory reads exactly `want` messages from the run's subject IN ORDER via
 // an ephemeral ordered consumer, decodes each into a fresh concrete checkpoint,
-// and validates the revisions form a contiguous 0..want-1 sequence. The ordered
-// consumer is ephemeral with a short inactivity threshold, so it self-cleans.
+// validates the revisions form a contiguous 0..want-1 sequence, and finally drains
+// the subject to ensure NO further messages remain (else the authoritative count
+// under-reported and we would have returned a silent prefix). The ordered consumer
+// is explicitly DELETED on every return path (it does NOT self-clean: a zero
+// InactiveThreshold defaults to 5 minutes server-side), with a short threshold as
+// a backstop if the process dies before cleanup runs. Every Fetch carries ctx, so
+// a cancelled/expired deadline aborts the pull immediately, not after fetchWait.
 func (s *Store) fetchHistory(ctx context.Context, subj string, id flow.GraphRunID, want uint64) ([]*flow.Checkpoint, error) {
 	cons, err := s.stream.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
-		FilterSubjects: []string{subj},
+		FilterSubjects:    []string{subj},
+		InactiveThreshold: historyInactiveThreshold,
 	})
 	if err != nil {
 		return nil, &flow.StoreError{Op: "History", Err: err}
 	}
+	// Delete the ephemeral consumer on EVERY exit path (error, success, or
+	// ctx-cancel) so no named server-side consumer outlives this call. The name is
+	// read inside the defer via CachedInfo so it reflects the consumer's CURRENT
+	// identity even if the ordered consumer reset (and renamed) mid-read. Cleanup
+	// uses a ctx that survives the caller's cancellation but is itself bounded, so
+	// it still runs when the caller's deadline already fired.
+	defer func() {
+		info := cons.CachedInfo()
+		if info == nil || info.Name == "" {
+			return
+		}
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), consumerDeleteTimeout)
+		defer cancel()
+		_ = s.stream.DeleteConsumer(dctx, info.Name)
+	}()
 
 	history := make([]*flow.Checkpoint, 0, want)
 	for uint64(len(history)) < want {
@@ -298,40 +375,104 @@ func (s *Store) fetchHistory(ctx context.Context, subj string, id flow.GraphRunI
 		if remaining < uint64(batchN) {
 			batchN = int(remaining)
 		}
-		batch, err := cons.Fetch(batchN, jetstream.FetchMaxWait(fetchWait))
+		got, err := s.fetchRound(ctx, cons, batchN, id, &history)
 		if err != nil {
-			return nil, &flow.StoreError{Op: "History", Err: err}
-		}
-		got := 0
-		for msg := range batch.Messages() {
-			cp, derr := decodeCheckpoint(msg.Data(), id)
-			if derr != nil {
-				return nil, &flow.StoreError{Op: "History", Err: derr}
-			}
-			// Contiguity: revision must equal its position (0..want-1).
-			if cp.Run.Revision != uint64(len(history)) {
-				return nil, &flow.StoreError{Op: "History", Err: fmt.Errorf(
-					"non-contiguous history: position %d has revision %d", len(history), cp.Run.Revision)}
-			}
-			history = append(history, cp)
-			got++
-		}
-		if err := batch.Error(); err != nil {
-			return nil, &flow.StoreError{Op: "History", Err: err}
+			return nil, err // already typed *flow.StoreError
 		}
 		if got == 0 {
 			// No progress in a full batch round but we still need more: the store is
-			// missing messages it claimed to have (fail secure).
-			return nil, &flow.StoreError{Op: "History", Err: fmt.Errorf(
-				"history truncated: got %d of %d expected", len(history), want)}
+			// missing messages the authoritative count claimed (fail secure).
+			return nil, &flow.StoreError{Op: "History", Err: &corruptHistoryError{Reason: fmt.Sprintf(
+				"truncated: got %d of %d expected", len(history), want)}}
 		}
 	}
+
+	// Drain check (High-1 hardening): `want` came from the last message's BODY; if
+	// that body under-reported, MORE messages exist on the subject and `history`
+	// would be a silent prefix. The SERVER's authoritative per-subject message
+	// count is the ground truth — if it disagrees with what we read, the store is
+	// corrupt (fail secure rather than truncate). This count is independent of both
+	// the advisory header and the (possibly lying) body.
+	if err := ctx.Err(); err != nil {
+		return nil, &flow.StoreError{Op: "History", Err: err}
+	}
+	count, err := s.subjectMsgCount(ctx, subj)
+	if err != nil {
+		return nil, &flow.StoreError{Op: "History", Err: err}
+	}
+	if count != uint64(len(history)) {
+		return nil, &flow.StoreError{Op: "History", Err: &corruptHistoryError{Reason: fmt.Sprintf(
+			"read %d messages but subject holds %d (authoritative count mismatch)", len(history), count)}}
+	}
 	return history, nil
+}
+
+// subjectMsgCount returns the SERVER's authoritative count of messages on subj,
+// via a subject-filtered stream-info request. It is the ground truth for the
+// History drain check — independent of any message header or body.
+//
+// CONCURRENCY: it obtains a FRESH stream handle per call (s.js.Stream) rather than
+// reusing s.stream, because jetstream's Stream.Info mutates a per-handle info
+// cache and is NOT safe for concurrent use on a shared handle. A fresh handle per
+// call keeps that mutation thread-local, so many parallel History calls on one
+// Store stay race-free.
+func (s *Store) subjectMsgCount(ctx context.Context, subj string) (uint64, error) {
+	stream, err := s.js.Stream(ctx, s.streamName)
+	if err != nil {
+		return 0, err
+	}
+	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(subj))
+	if err != nil {
+		return 0, err
+	}
+	// With a subject filter the server populates State.Subjects[subj] with the
+	// count; an absent entry means zero messages on the subject.
+	return info.State.Subjects[subj], nil
+}
+
+// fetchRound pulls up to batchN messages, decodes each into a fresh concrete
+// checkpoint, verifies contiguity (revision == position), and appends them to
+// *history. It returns the count delivered this round. The pull is bounded by a
+// per-round child context capped at fetchWait — FetchContext threads cancellation
+// in (High-2) and the cap bounds an otherwise-deadline-free caller; the cancel is
+// released before returning so no timer leaks. All errors are typed *flow.StoreError.
+func (s *Store) fetchRound(ctx context.Context, cons jetstream.Consumer, batchN int, id flow.GraphRunID, history *[]*flow.Checkpoint) (int, error) {
+	fctx, cancel := context.WithTimeout(ctx, fetchWait)
+	defer cancel()
+
+	batch, err := cons.Fetch(batchN, jetstream.FetchContext(fctx))
+	if err != nil {
+		return 0, &flow.StoreError{Op: "History", Err: err}
+	}
+	got := 0
+	for msg := range batch.Messages() {
+		cp, derr := s.decodeCheckpoint(msg.Data(), id)
+		if derr != nil {
+			return got, &flow.StoreError{Op: "History", Err: derr}
+		}
+		// Contiguity: revision must equal its position (0..N).
+		if cp.Run.Revision != uint64(len(*history)) {
+			return got, &flow.StoreError{Op: "History", Err: &corruptHistoryError{Reason: fmt.Sprintf(
+				"position %d has revision %d (expected contiguous)", len(*history), cp.Run.Revision)}}
+		}
+		*history = append(*history, cp)
+		got++
+	}
+	if err := batch.Error(); err != nil {
+		return got, &flow.StoreError{Op: "History", Err: err}
+	}
+	return got, nil
 }
 
 // lastRevisionAndSeq returns the prior revision and stream sequence for subj. When
 // the subject has no messages yet it returns (0, 0): the next revision is 0 and
 // the expected-last-sequence gate of 0 means "subject is empty".
+//
+// This serves ONLY Append's client-side pre-check; the returned expectedRev may
+// derive from the advisory header (cheap), but Append's correctness rests on the
+// returned expectedSeq (the authoritative stream sequence) feeding the server
+// gate, not on the revision. History never uses this — it decodes the body for an
+// authoritative count (see History).
 func (s *Store) lastRevisionAndSeq(ctx context.Context, subj string) (expectedRev, expectedSeq uint64, err error) {
 	last, err := s.stream.GetLastMsgForSubject(ctx, subj)
 	if err != nil {
@@ -355,7 +496,7 @@ func revisionOf(msg *jetstream.RawStreamMsg) (uint64, error) {
 		if v := msg.Header.Get(revisionHeader); v != "" {
 			rev, err := strconv.ParseUint(v, 10, 64)
 			if err != nil {
-				return 0, fmt.Errorf("invalid %s header %q: %w", revisionHeader, v, err)
+				return 0, &corruptHeaderError{Value: v, Err: err}
 			}
 			return rev, nil
 		}
@@ -368,16 +509,24 @@ func revisionOf(msg *jetstream.RawStreamMsg) (uint64, error) {
 }
 
 // decodeCheckpoint unmarshals UNTRUSTED stored bytes into a FRESH concrete
-// flow.Checkpoint (never any), then validates the embedded run id matches the
-// requested id — a mismatch means the store returned a misrouted/corrupt message.
-// A fresh value per call also gives output-side immutability.
-func decodeCheckpoint(data []byte, want flow.GraphRunID) (*flow.Checkpoint, error) {
+// flow.Checkpoint (never any), bounding the payload size BEFORE decode (§10.4:
+// guard against unbounded/oversized input independently of the stream's own limit,
+// which can drift if a stream pre-existed), then validates the embedded run id
+// matches the requested id — a mismatch means the store returned a misrouted or
+// corrupt message. A fresh value per call also gives output-side immutability.
+func (s *Store) decodeCheckpoint(data []byte, want flow.GraphRunID) (*flow.Checkpoint, error) {
+	if s.maxMsgSize > 0 && len(data) > int(s.maxMsgSize) {
+		return nil, &flow.CheckpointDecodeError{
+			Field: "checkpoint",
+			Err:   fmt.Errorf("stored checkpoint is %d bytes, exceeds limit %d", len(data), s.maxMsgSize),
+		}
+	}
 	var cp flow.Checkpoint
 	if err := json.Unmarshal(data, &cp); err != nil {
 		return nil, &flow.CheckpointDecodeError{Field: "checkpoint", Err: err}
 	}
 	if cp.Run.GraphRunID != want {
-		return nil, fmt.Errorf("checkpoint run id %s does not match requested %s", cp.Run.GraphRunID, want)
+		return nil, &flow.GraphRunMismatchError{Requested: want, Actual: cp.Run.GraphRunID}
 	}
 	return &cp, nil
 }
