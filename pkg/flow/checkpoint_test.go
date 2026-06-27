@@ -1,6 +1,7 @@
 package flow
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"testing"
@@ -306,9 +307,23 @@ func TestCheckpointInterruptsHaltMutualExclusion(t *testing.T) {
 }
 
 // FuzzCheckpointRoundTrip treats stored checkpoint bytes as untrusted input
-// (§10.4): json.Unmarshal must never panic on arbitrary bytes; on success,
-// re-marshal/re-unmarshal must be deeply equal (decode is idempotent /
-// normalizing). Invalid bytes must return an error, not panic (§15).
+// (§10.4): json.Unmarshal must never panic on arbitrary bytes (invalid bytes
+// return an error, not a panic — §15), and decode is IDEMPOTENT ON THE
+// NORMALIZED FORM.
+//
+// Why "normalized form" and not raw byte-equality: a Checkpoint carries
+// json.RawMessage serialization-boundary fields (StepBase/State/Info/
+// Continuation). The FIRST Marshal of an arbitrary-bytes decode normalizes those
+// raw bytes — Go's encoder HTML-escapes &,<,> (e.g. a literal & becomes &)
+// and compacts internal whitespace — so cp != Marshal→Unmarshal(cp) on such
+// inputs. That is INHERENT JSON RawMessage normalization, not corruption: the
+// values are semantically identical (a RawMessage is always consumed via
+// json.Unmarshal, where & and & are the same key) and the engine itself
+// ALWAYS produces StepBase/State via json.Marshal (already-normalized), so real
+// checkpoints round-trip stably. The invariant we pin is the fixed point: once
+// normalized by one round-trip, further round-trips are deeply equal (and emit
+// identical bytes). The corpus seed 07484ae250e7d32e (StepBase {"&...":0,...})
+// is the regression guard for this normalization class.
 func FuzzCheckpointRoundTrip(f *testing.F) {
 	seeds := []Checkpoint{
 		fullInterruptCheckpoint(),
@@ -331,18 +346,37 @@ func FuzzCheckpointRoundTrip(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		var cp Checkpoint
 		if err := json.Unmarshal(data, &cp); err != nil {
-			return // invalid bytes: an error, not a panic — acceptable.
+			return // invalid bytes: an error, not a panic — acceptable (§10.4).
 		}
-		b, err := json.Marshal(cp)
+		// Re-marshal NORMALIZES json.RawMessage fields (StepBase/State): Go's
+		// encoder HTML-escapes &,<,> and compacts whitespace, so the FIRST
+		// round-trip may change those raw bytes (the values are unchanged — a
+		// RawMessage is always consumed via Unmarshal). The invariant is that the
+		// NORMALIZED form is a fixed point: after one round-trip, further
+		// round-trips are deeply equal (and byte-identical). The engine always
+		// produces normalized StepBase via json.Marshal, so real checkpoints are
+		// stable; the engine is correct, the assertion was over-strict.
+		b1, err := json.Marshal(cp)
 		if err != nil {
 			t.Fatalf("re-Marshal() error = %v", err)
 		}
 		var cp2 Checkpoint
-		if err := json.Unmarshal(b, &cp2); err != nil {
+		if err := json.Unmarshal(b1, &cp2); err != nil {
 			t.Fatalf("re-Unmarshal() error = %v", err)
 		}
-		if !reflect.DeepEqual(cp, cp2) {
-			t.Errorf("decode not idempotent:\n cp  = %#v\n cp2 = %#v", cp, cp2)
+		b2, err := json.Marshal(cp2)
+		if err != nil {
+			t.Fatalf("re-Marshal(2) error = %v", err)
+		}
+		var cp3 Checkpoint
+		if err := json.Unmarshal(b2, &cp3); err != nil {
+			t.Fatalf("re-Unmarshal(2) error = %v", err)
+		}
+		if !reflect.DeepEqual(cp2, cp3) {
+			t.Errorf("decode not idempotent on normalized form:\n cp2 = %#v\n cp3 = %#v", cp2, cp3)
+		}
+		if !bytes.Equal(b1, b2) {
+			t.Errorf("normalized form not a byte fixed point:\n b1 = %s\n b2 = %s", b1, b2)
 		}
 	})
 }

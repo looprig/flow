@@ -35,6 +35,12 @@ const (
 
 	// durPollInterval is the gap between durable-status polls.
 	durPollInterval = 10 * time.Millisecond
+
+	// durStayWindow bounds the RED variant: with no resume submitted after the
+	// restart, the run must STAY interrupted for at least this long (and never reach
+	// RunCompleted). Generous enough that a fresh worker would have acted on any
+	// pending work by now, short enough to keep the test snappy.
+	durStayWindow = 500 * time.Millisecond
 )
 
 // durState is the demo graph's JSON-serializable blackboard for the durability run.
@@ -224,76 +230,133 @@ func waitStatus(t *testing.T, st durStack, id flow.GraphRunID, want flow.RunStat
 }
 
 // TestDistributedDurabilityAcrossWorkerRestart is the headline Tier-C durability
-// proof. It submits a human-in-the-loop run, waits until it INTERRUPTS (checkpoint
-// durable in nats.Store), KILLS the worker that produced the pause, starts a FRESH
-// worker on the SAME store + control plane, submits the resume, and asserts the new
-// worker resumes from the durable checkpoint and completes the run — proving the
-// checkpoint survived the worker restart in nats.Store and the work flowed through
-// nats.ControlPlane.
+// proof, run as a table whose two rows share the SAME restart narrative — submit a
+// human-in-the-loop run, wait until it INTERRUPTS (checkpoint durable in nats.Store),
+// KILL the worker that produced the pause, start a FRESH worker on the SAME store +
+// control plane — and diverge ONLY on whether a durable OpResume is then submitted:
+//
+//   - resume=true  (happy path): submit OpResume; the fresh worker resumes from the
+//     durable checkpoint and COMPLETES, proving completion came ONLY from the
+//     durable checkpoint + control-plane work (worker #1 is gone).
+//   - resume=false (RED variant): submit NOTHING after the restart; assert the run
+//     STAYS RunInterrupted and NEVER reaches RunCompleted within a bounded window.
+//     This gives the proof teeth: completion REQUIRES the durable resume — there is
+//     no in-memory shortcut that finishes the run on its own.
+//
+// Each row boots its OWN embedded JetStream server + store + control plane (no shared
+// state), so the subtests run in parallel.
 func TestDistributedDurabilityAcrossWorkerRestart(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_, st := newDurStack(t, ctx)
-
-	// --- Worker #1: run until the human-in-the-loop interrupt is durable. ---
-	stop1 := startWorker(t, st)
-
-	runID := durRunID(0x42)
-	input, err := json.Marshal(durState{Name: "Ada"})
-	if err != nil {
-		t.Fatalf("marshal input: %v", err)
+	tests := []struct {
+		name   string
+		resume bool // submit OpResume after the worker restart?
+	}{
+		{name: "resume completes from durable checkpoint", resume: true},
+		{name: "no resume stays interrupted (no in-memory shortcut)", resume: false},
 	}
-	if err := st.cp.Submit(ctx, flow.Work{
-		Key:        st.key,
-		GraphRunID: runID,
-		Op:         flow.OpRun,
-		Input:      input,
-	}); err != nil {
-		t.Fatalf("Submit OpRun: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	// The run must reach RunInterrupted, and that pause must be DURABLE in nats.Store.
-	st1 := waitStatus(t, st, runID, flow.RunInterrupted)
-	if st1.GraphRunID != runID {
-		t.Fatalf("interrupted run id = %s, want %s", st1.GraphRunID, runID)
-	}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			_, st := newDurStack(t, ctx) // fresh embedded server + store + control plane per row
 
-	// --- Simulate a worker RESTART: kill worker #1, start a fresh worker #2. ---
-	stop1() // worker #1 gone (Serve returned, no goroutine left)
+			// --- Worker #1: run until the human-in-the-loop interrupt is durable. ---
+			stop1 := startWorker(t, st)
 
-	stop2 := startWorker(t, st) // fresh worker on the SAME durable store + control plane
-	defer stop2()
+			runID := durRunID(0x42)
+			input, err := json.Marshal(durState{Name: "Ada"})
+			if err != nil {
+				t.Fatalf("marshal input: %v", err)
+			}
+			if err := st.cp.Submit(ctx, flow.Work{
+				Key:        st.key,
+				GraphRunID: runID,
+				Op:         flow.OpRun,
+				Input:      input,
+			}); err != nil {
+				t.Fatalf("Submit OpRun: %v", err)
+			}
 
-	// --- Resume through the control plane; worker #2 must pick it up. ---
-	if err := st.cp.Submit(ctx, flow.Work{
-		Key:        st.key,
-		GraphRunID: runID,
-		Op:         flow.OpResume,
-		Input:      json.RawMessage(durResumeNote),
-	}); err != nil {
-		t.Fatalf("Submit OpResume: %v", err)
-	}
+			// The run must reach RunInterrupted, and that pause must be DURABLE in nats.Store.
+			st1 := waitStatus(t, st, runID, flow.RunInterrupted)
+			if st1.GraphRunID != runID {
+				t.Fatalf("interrupted run id = %s, want %s", st1.GraphRunID, runID)
+			}
 
-	// The FRESH worker must resume from the durable checkpoint and COMPLETE the run.
-	final := waitStatus(t, st, runID, flow.RunCompleted)
-	if final.GraphRunID != runID {
-		t.Fatalf("completed run id = %s, want %s", final.GraphRunID, runID)
-	}
+			// --- Simulate a worker RESTART: kill worker #1, start a fresh worker #2. ---
+			stop1() // worker #1 gone (Serve returned, no goroutine left)
 
-	// Assert the durable final STATE reflects the full path: greeted, approved, sent.
-	cp, err := st.store.Latest(ctx, runID)
-	if err != nil {
-		t.Fatalf("Latest after completion: %v", err)
+			stop2 := startWorker(t, st) // fresh worker on the SAME durable store + control plane
+			defer stop2()
+
+			if !tt.resume {
+				// RED variant: NO resume submitted. The fresh worker has the durable
+				// checkpoint but no work to act on, so the run must STAY RunInterrupted
+				// and NEVER reach RunCompleted within a bounded window — proving
+				// completion REQUIRES the durable resume, not an in-memory shortcut.
+				if got := stillInterrupted(t, st, runID); got != flow.RunInterrupted {
+					t.Fatalf("without resume, run advanced to %v; want it to stay %v (completion must require the durable resume)", got, flow.RunInterrupted)
+				}
+				return
+			}
+
+			// --- Resume through the control plane; worker #2 must pick it up. ---
+			if err := st.cp.Submit(ctx, flow.Work{
+				Key:        st.key,
+				GraphRunID: runID,
+				Op:         flow.OpResume,
+				Input:      json.RawMessage(durResumeNote),
+			}); err != nil {
+				t.Fatalf("Submit OpResume: %v", err)
+			}
+
+			// The FRESH worker must resume from the durable checkpoint and COMPLETE the run.
+			final := waitStatus(t, st, runID, flow.RunCompleted)
+			if final.GraphRunID != runID {
+				t.Fatalf("completed run id = %s, want %s", final.GraphRunID, runID)
+			}
+
+			// Assert the durable final STATE reflects the full path: greeted, approved, sent.
+			cp, err := st.store.Latest(ctx, runID)
+			if err != nil {
+				t.Fatalf("Latest after completion: %v", err)
+			}
+			var got durState
+			if err := json.Unmarshal(cp.State, &got); err != nil {
+				t.Fatalf("decode final state %s: %v", cp.State, err)
+			}
+			if got.Message == "" || !got.Approved || !got.Sent {
+				t.Errorf("final state = %+v, want greeted+approved+sent", got)
+			}
+		})
 	}
-	var got durState
-	if err := json.Unmarshal(cp.State, &got); err != nil {
-		t.Fatalf("decode final state %s: %v", cp.State, err)
+}
+
+// stillInterrupted polls the DURABLE store over a short bounded window and asserts
+// the run NEVER reaches RunCompleted, returning the last durable status observed. It
+// is the teeth of the RED variant: with no OpResume after the restart, the fresh
+// worker must NOT finish the run on its own (no in-memory shortcut). It fails fast if
+// the run ever advances to RunCompleted within the budget.
+func stillInterrupted(t *testing.T, st durStack, id flow.GraphRunID) flow.RunStatus {
+	t.Helper()
+	deadline := time.Now().Add(durStayWindow)
+	var last flow.RunStatus = -1
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cp, err := st.store.Latest(ctx, id)
+		cancel()
+		if err == nil {
+			last = cp.Run.Status
+			if cp.Run.Status == flow.RunCompleted {
+				t.Fatalf("run %s reached RunCompleted WITHOUT a durable resume — completion must require the resume, not an in-memory shortcut", id)
+			}
+		}
+		time.Sleep(durPollInterval)
 	}
-	if got.Message == "" || !got.Approved || !got.Sent {
-		t.Errorf("final state = %+v, want greeted+approved+sent", got)
-	}
+	return last
 }
 
 // durRunID builds a deterministic non-zero GraphRunID from a single byte.
