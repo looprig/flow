@@ -398,3 +398,50 @@ func TestInterruptSignalNoPayloadLeak(t *testing.T) {
 		})
 	}
 }
+
+// TestUnexportedErrorMessages pins the Error() strings of the two UNEXPORTED engine
+// errors that never reach a public errors.As (so the table above cannot cover them):
+// errObservedCancellation (engine.go — converted away before any public return) and
+// phaseComboError (errors.go — wrapped inside a CheckpointDecodeError on §10.4 load
+// validation). Both must render a non-empty "flow:"-prefixed, salient message for
+// internal logging and the wrapped public message.
+func TestUnexportedErrorMessages(t *testing.T) {
+	t.Parallel()
+
+	grid, err := NewGraphRunID()
+	if err != nil {
+		t.Fatalf("NewGraphRunID: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		err   error
+		match []string
+	}{
+		{
+			name:  "errObservedCancellation",
+			err:   &errObservedCancellation{run: GraphRunState{GraphRunID: grid}},
+			match: []string{grid.String(), "cancellation"},
+		},
+		{
+			name:  "phaseComboError",
+			err:   &phaseComboError{detail: "StepPaused requires ≥1 Interrupts and no Halt"},
+			match: []string{"phase", "StepPaused requires"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			msg := tt.err.Error()
+			if !strings.HasPrefix(msg, "flow: ") {
+				t.Errorf("Error() = %q, want prefix %q", msg, "flow: ")
+			}
+			for _, want := range tt.match {
+				if !strings.Contains(msg, want) {
+					t.Errorf("Error() = %q, missing %q", msg, want)
+				}
+			}
+		})
+	}
+}
