@@ -3,11 +3,29 @@ package flow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 )
+
+// errObservedCancellation is the UNEXPORTED sentinel append returns when a lost
+// compare-and-append is read as OBSERVED CANCELLATION (§18.2): the coordinator's
+// write lost to a concurrent Cancel, so the run must stop gracefully rather than
+// surface a *RevisionConflictError. It carries the cancelled GraphRunState from
+// the now-Cancelled latest so the converter (gracefulOnCancel) can build the
+// terminal Result. It NEVER escapes to callers — run/continueFrom convert it to a
+// (Result, nil) before returning.
+type errObservedCancellation struct {
+	run GraphRunState
+}
+
+// Error names the observed cancellation. It is unexported and converted away
+// before any public return, so this string is for internal logging only.
+func (e *errObservedCancellation) Error() string {
+	return "flow: observed cancellation of run " + e.run.GraphRunID.String()
+}
 
 // This file is the BSP coordinator (design §9.2): the per-run engine that owns
 // one run's GraphRunID, accumulated state S, frontier, and GraphRunState, and is
@@ -48,6 +66,10 @@ type coordinator[S any] struct {
 	frontier     []VertexID
 	stepBaseJSON json.RawMessage
 	finishRan    bool
+	// nextRev is the revision the next checkpoint will be written at; c.rs.Revision
+	// tracks the LAST written revision, so Result.Run.Revision matches the store's
+	// Latest. append sets c.rs.Revision = nextRev then advances nextRev on success.
+	nextRev uint64
 	// carry holds the already-committed TERMINAL VertexStates (Done / Failed-Route)
 	// of the step a Resume is re-running, so every intermediate PerVertex
 	// StepRunning checkpoint written during that resumed step lists the FULL step,
@@ -107,9 +129,24 @@ type vertexRun[S any] struct {
 // is surfaced in Result.Halt, NEVER as an engine error (§9.8, §12.3).
 func (c *coordinator[S]) run(ctx context.Context) (*Result[S], error) {
 	if err := c.seed(ctx); err != nil {
-		return nil, err
+		return c.gracefulOnCancel(nil, err)
 	}
-	return c.loop(ctx)
+	return c.gracefulOnCancel(c.loop(ctx))
+}
+
+// gracefulOnCancel converts an *errObservedCancellation sentinel (raised by append
+// when a write lost to a concurrent Cancel, §18.2) into a graceful terminal Result
+// reflecting the cancellation — Run is the cancelled GraphRunState from the
+// now-Cancelled latest and State is the coordinator's last committed state — with a
+// NIL error. Any other error (including a genuine *RevisionConflictError) passes
+// through unchanged. It is the single conversion seam every public coordinator
+// entrypoint (run, continueFrom) applies to its result.
+func (c *coordinator[S]) gracefulOnCancel(res *Result[S], err error) (*Result[S], error) {
+	var observed *errObservedCancellation
+	if errors.As(err, &observed) {
+		return &Result[S]{Run: observed.run, State: c.state}, nil
+	}
+	return res, err
 }
 
 // loop drives the super-step loop from the CURRENT frontier and step to a terminal
@@ -816,19 +853,51 @@ func (c *coordinator[S]) checkpoint(phase StepPhase) (*Checkpoint, error) {
 // append stamps the next monotonic revision and UpdatedAt onto the checkpoint and
 // the run, durably appends it (compare-and-append, §10.2), and fires OnCheckpoint.
 // It is the single point where a checkpoint is written and the revision advances,
-// so revisions stay contiguous (0,1,2,…) across every phase.
+// so revisions stay contiguous (0,1,2,…) across every phase. A lost
+// compare-and-append against a now-Cancelled latest is read as OBSERVED
+// CANCELLATION (§18.2): instead of the *RevisionConflictError it returns the
+// unexported *errObservedCancellation sentinel carrying the cancelled run record,
+// which every append-caller path converts into a graceful cancellation Result. A
+// genuine concurrent-resume conflict (the latest is NOT Cancelled) propagates the
+// *RevisionConflictError unchanged.
 func (c *coordinator[S]) append(ctx context.Context, cp *Checkpoint) error {
+	// c.rs.Revision tracks the LAST written revision; nextRev is the revision to
+	// write now (contiguous 0,1,2,…). Setting c.rs.Revision = nextRev before the
+	// snapshot makes cp.Run.Revision the written revision AND leaves c.rs — hence
+	// Result.Run.Revision — reflecting the latest persisted revision, matching the
+	// store's Latest. nextRev advances only AFTER a successful append, so a failed
+	// append does not advance the sequence.
+	c.rs.Revision = c.nextRev
 	c.rs.UpdatedAt = time.Now()
-	// cp.Run snapshots the current run-level record, whose Revision is the next to
-	// write; Revision is bumped only AFTER a successful append, so revisions stay
-	// contiguous (0,1,2,…) and a failed append does not advance the sequence.
 	cp.Run = c.rs
 	if err := c.store.Append(ctx, cp); err != nil {
+		return c.classifyAppendErr(ctx, err)
+	}
+	c.cfg.hooks.onCheckpoint(ctx, c.rs.GraphRunID, c.nextRev, c.rs.Step)
+	c.nextRev++
+	return nil
+}
+
+// classifyAppendErr distinguishes a lost compare-and-append that is an OBSERVED
+// CANCELLATION from a genuine concurrent-writer conflict (§18.2). On a
+// *RevisionConflictError it loads the latest checkpoint: if its run is Cancelled,
+// the worker lost to a concurrent Cancel and must stop gracefully, so it returns
+// *errObservedCancellation carrying that cancelled GraphRunState. Otherwise (a
+// genuine concurrent-resume conflict, or a Latest read failure — fail secure) it
+// returns the original error unchanged.
+func (c *coordinator[S]) classifyAppendErr(ctx context.Context, err error) error {
+	var conflict *RevisionConflictError
+	if !errors.As(err, &conflict) {
 		return err
 	}
-	c.cfg.hooks.onCheckpoint(ctx, c.rs.GraphRunID, c.rs.Revision, c.rs.Step)
-	c.rs.Revision++
-	return nil
+	latest, lerr := c.store.Latest(ctx, c.rs.GraphRunID)
+	if lerr != nil {
+		return err
+	}
+	if latest.Run.Status == RunCancelled {
+		return &errObservedCancellation{run: latest.Run}
+	}
+	return err
 }
 
 // vertexStates extracts the per-vertex records from a step's runs for a

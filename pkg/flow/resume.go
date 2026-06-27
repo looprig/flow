@@ -188,15 +188,16 @@ func validatePhase(cp *Checkpoint) error {
 }
 
 // reconstruct rebuilds a coordinator from a validated checkpoint (§9.3): the
-// decoded state, the run record reset to RunRunning with the revision sequence
-// continued (cp.Run.Revision + 1, so the next checkpoint append continues the
-// append-only sequence), the frozen step base carried forward, and finishRan
-// re-derived from History (a finish that ran Done in ANY prior step). It does not
-// yet write a checkpoint — continueFrom drives the continuation.
+// decoded state, the run record reset to RunRunning with Revision = the LAST
+// written revision (cp.Run.Revision) and nextRev = cp.Run.Revision + 1, so the
+// next checkpoint append continues the append-only sequence while Result.Run.Revision
+// reflects the latest persisted revision, the frozen step base carried forward,
+// and finishRan re-derived from History (a finish that ran Done in ANY prior step).
+// It does not yet write a checkpoint — continueFrom drives the continuation.
 func (r *Runner[S]) reconstruct(ctx context.Context, cfg runConfig, cp *Checkpoint, state S) *coordinator[S] {
 	rs := cp.Run
 	rs.Status = RunRunning
-	rs.Revision = cp.Run.Revision + 1
+	rs.Revision = cp.Run.Revision
 	return &coordinator[S]{
 		graph:        r.graph,
 		entry:        r.entry,
@@ -205,6 +206,7 @@ func (r *Runner[S]) reconstruct(ctx context.Context, cfg runConfig, cp *Checkpoi
 		cfg:          cfg,
 		state:        state,
 		rs:           rs,
+		nextRev:      cp.Run.Revision + 1,
 		frontier:     cp.Frontier,
 		stepBaseJSON: cp.StepBase,
 		finishRan:    r.finishRanInHistory(ctx, cp.Run.GraphRunID),
@@ -238,6 +240,14 @@ func (r *Runner[S]) finishRanInHistory(ctx context.Context, id GraphRunID) bool 
 // whole step; StepHalted retries routing/continuation. The Phase was validated, so
 // the default is unreachable but fails secure.
 func (c *coordinator[S]) continueFrom(ctx context.Context, cp *Checkpoint, payload any) (*Result[S], error) {
+	return c.gracefulOnCancel(c.dispatchPhase(ctx, cp, payload))
+}
+
+// dispatchPhase routes the reconstructed coordinator to the continuation for the
+// checkpoint's Phase (§9.3); continueFrom wraps it through gracefulOnCancel so a
+// resumed run that loses its append to a concurrent Cancel also stops gracefully
+// (§18.2). The Phase was validated, so the default is unreachable but fails secure.
+func (c *coordinator[S]) dispatchPhase(ctx context.Context, cp *Checkpoint, payload any) (*Result[S], error) {
 	switch cp.Phase {
 	case StepRouted:
 		return c.loop(ctx)
