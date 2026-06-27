@@ -296,6 +296,56 @@ func TestControlPlaneCompetingConsumers(t *testing.T) {
 	}
 }
 
+// TestControlPlaneMultiKeyFanIn proves multi-key fan-in: a SINGLE Consume over two
+// DISTINCT keys (k1, k2) feeds BOTH keys' work onto the ONE returned channel. Each
+// key gets its own shared durable (distinct FilterSubjects, no work-queue overlap),
+// and every key's deliveries fan in to the single channel a `range`-ing worker
+// loop reads — the property flow.Serve relies on to serve many versions from one
+// worker. Submitting to each key and collecting both off the one channel locks it
+// in.
+func TestControlPlaneMultiKeyFanIn(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, cp := newTestCP(t, ctx)
+
+	k1, k2 := cpGVK(7, "v1"), cpGVK(8, "v2")
+	ch, err := cp.Consume(ctx, []flow.GraphVersionKey{k1, k2})
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+
+	w1 := cpWork(k1, cpRunID(71), `{"k":1}`)
+	w2 := cpWork(k2, cpRunID(82), `{"k":2}`)
+	if err := cp.Submit(ctx, w1); err != nil {
+		t.Fatalf("Submit k1: %v", err)
+	}
+	if err := cp.Submit(ctx, w2); err != nil {
+		t.Fatalf("Submit k2: %v", err)
+	}
+
+	// Collect exactly two deliveries off the single fanned-in channel and assert one
+	// for EACH key arrived (order is not guaranteed across two subscriptions).
+	got := make(map[flow.GraphVersionKey]flow.GraphRunID, 2)
+	for len(got) < 2 {
+		d := cpRecv(t, ch)
+		if _, dup := got[d.Work.Key]; dup {
+			t.Fatalf("key %v delivered twice; want one per key", d.Work.Key)
+		}
+		got[d.Work.Key] = d.Work.GraphRunID
+		if err := d.Ack(); err != nil {
+			t.Errorf("Ack: %v", err)
+		}
+	}
+	if got[k1] != w1.GraphRunID {
+		t.Errorf("k1 delivered run = %s, want %s", got[k1], w1.GraphRunID)
+	}
+	if got[k2] != w2.GraphRunID {
+		t.Errorf("k2 delivered run = %s, want %s", got[k2], w2.GraphRunID)
+	}
+}
+
 // TestControlPlaneContextCancelClosesChannel proves clean shutdown: cancelling
 // the run ctx closes the returned Delivery channel (so a worker's `range`
 // terminates) and a subsequent Submit honoring a cancelled ctx returns an error.

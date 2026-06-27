@@ -278,6 +278,17 @@ type ControlPlane struct {
 // for the stream-ensure call. A nil connection, a client build failure, a config
 // error, or a stream-ensure failure is returned as a typed pkg/nats error
 // (fail-secure — no half-constructed plane escapes).
+//
+// SHARED-DURABLE CONFIG (co-serving workers MUST use identical options). Workers
+// that co-serve the same key CONVERGE on ONE shared durable consumer, named
+// deterministically by the routing token (durableFor), via CreateOrUpdateConsumer.
+// That call is "create-or-UPDATE": the FIRST worker creates the durable with its
+// resolved AckWait/MaxDeliver/BackOff; a later worker passing DIFFERENT options
+// would silently UPDATE the shared durable's config — changing redelivery behavior
+// out from under every peer already attached to it. Therefore every process
+// co-serving a key MUST construct its ControlPlane with IDENTICAL options
+// (WithAckWait/WithMaxDeliver/WithNackDelay/WithWorkStreamName/WithWorkMaxMsgSize).
+// The same caveat applies to Consume, which is where the shared durable is ensured.
 func NewControlPlane(ctx context.Context, nc *nats.Conn, opts ...ControlPlaneOption) (*ControlPlane, error) {
 	if nc == nil {
 		return nil, &SetupError{Err: errors.New("nil nats connection")}
@@ -370,6 +381,12 @@ func (cp *ControlPlane) Submit(ctx context.Context, w flow.Work) error {
 // deleted (other workers/restarts depend on them) — only the local subscriptions
 // are stopped. A nil/empty serves registers a worker that receives nothing (its
 // channel still closes on ctx.Done). A duplicate key in serves is consumed once.
+//
+// SHARED-DURABLE CONFIG: this is where the per-key shared durable is ensured
+// (CreateOrUpdateConsumer). All workers co-serving a key attach to ONE durable, so
+// they MUST construct their ControlPlanes with IDENTICAL options — see
+// NewControlPlane's "SHARED-DURABLE CONFIG" note for why differing options would
+// silently re-config the shared durable for every peer.
 func (cp *ControlPlane) Consume(ctx context.Context, serves []flow.GraphVersionKey) (<-chan flow.Delivery, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, &ConsumeError{Err: err}
@@ -481,6 +498,14 @@ func (cp *ControlPlane) ensureConsumer(ctx context.Context, key flow.GraphVersio
 		Durable:       durableFor(key),
 		FilterSubject: workSubjectFor(key),
 		AckPolicy:     jetstream.AckExplicitPolicy,
+		// DeliverAll is the ONLY valid policy for a WorkQueuePolicy stream's consumer:
+		// the queue's contract is "deliver every enqueued message exactly once until
+		// acked", so the consumer must start from the first un-acked message, never
+		// skip to "new" (which would silently drop already-enqueued work). It is the
+		// jetstream default today, but set it EXPLICITLY so the contract is
+		// self-documenting and robust to a future default change (CLAUDE.md: fail
+		// secure; don't rely on an implicit default for a correctness property).
+		DeliverPolicy: jetstream.DeliverAllPolicy,
 		AckWait:       cp.ackWait,
 		MaxDeliver:    cp.maxDeliver,
 		BackOff:       backoffSchedule(),
