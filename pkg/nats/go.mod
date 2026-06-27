@@ -5,6 +5,7 @@ go 1.25.0
 replace github.com/ciram-co/flow => ../..
 
 require (
+	github.com/ciram-co/flow v0.0.0-00010101000000-000000000000
 	github.com/nats-io/nats-server/v2 v2.14.2
 	github.com/nats-io/nats.go v1.52.0
 )
