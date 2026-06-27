@@ -84,10 +84,22 @@ type Delivery struct {
 
 // ControlPlane accepts work and distributes it to workers (§18.5). It is SEPARATE
 // from CheckpointStore (transient consume-once dispatch vs durable append-only
-// history). Implementations must honor ctx on every call (no unbounded blocking)
-// and must guarantee single-flight per run: never deliver two Works for the same
-// GraphRunID concurrently. Registration is implicit — a worker registers by
-// Consuming the version keys it serves; there is no separate registration RPC.
+// history). Implementations must honor ctx on every call (no unbounded blocking).
+// Registration is implicit — a worker registers by Consuming the version keys it
+// serves; there is no separate registration RPC.
+//
+// SINGLE-FLIGHT (best-effort, NOT the correctness boundary). An implementation
+// SHOULD avoid delivering two Works for the same GraphRunID concurrently, to spare
+// duplicate work — but it need not guarantee it. The in-process plane
+// (controlplane.Mem) DOES guarantee it via a central dispatcher; a distributed
+// plane (nats.ControlPlane) provides single-flight at MESSAGE granularity (a
+// work-queue delivers each message once until it is acked), so two DISTINCT
+// messages for the same run can be processed concurrently. That is safe by design:
+// CORRECTNESS — no duplicate COMMITTED effects — is guaranteed by the store's
+// compare-and-append (RevisionConflictError, §10.2) and IdempotencyKey (§4.1),
+// which absorb concurrent duplicate work; the control plane's single-flight is only
+// an efficiency optimization. Providing STRICTER single-flight than required still
+// satisfies this contract (LSP), so controlplane.Mem remains conformant.
 type ControlPlane interface {
 	// Submit enqueues w for consumers serving w.Key. It honors ctx and must not
 	// block unboundedly.

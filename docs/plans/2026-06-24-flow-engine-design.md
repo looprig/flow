@@ -768,7 +768,7 @@ The engine core (`pkg/flow`) is a pure, in-process, transport-agnostic library. 
 | **Registry** | resolve `(GraphID, GraphVersion) → RunnerHandle` (a lookup) | No |
 | **Dispatcher** | resolve via registry, invoke the worker, report not-found | No |
 | **Ingress** (`ingress`) | carry external requests in/out, map errors | No |
-| **Control plane** (`controlplane` / `nats`) | queue + distribute work; feed workers; single-flight per run (§18.5) | No |
+| **Control plane** (`controlplane` / `nats`) | queue + distribute work; feed workers; best-effort single-flight, correctness via store compare-and-append (§18.5) | No |
 | **CheckpointStore** (`flow` / `nats`) | persist durable run state | No |
 
 A `RunnerHandle` is the graph-agnostic, JSON-in/out wrapper of a typed `Runner[S]` (possible because `S` is JSON-serializable). The registry is keyed by `(GraphID, GraphVersion)`, so one process can serve **multiple versions** of a graph and resolve a resume to the matching one. The registry is a **pure resolver** — it neither executes nor routes across workers. The roles above compose into one or more **processes** as your deployment needs (§18.5); routing across processes is the control plane's job, not the registry's.
@@ -796,8 +796,8 @@ Every run response carries `graphVersion`. Typed errors map to status (`GraphRun
 
 NATS supplies the substrate for distributed, durable runs while the `Runner` stays the executor:
 
-- **Durability** — `nats.Store` implements `CheckpointStore` on JetStream (KV/object), preserving the append-only + compare-and-append contract (`(GraphRunID, Revision)` unique). Same interface as `MemStore`.
-- **Distribution & version routing** — workers subscribe to durable consumers on subjects encoding the version: `work.{graphID}.{graphVersion}.{graphRunID}`. A worker subscribes only to the versions in its registry, so JetStream delivers each run's work to a capable worker — **the version router *is* the subject space**, no separate LB needed. A per-`GraphRunID` work-queue keeps a run **single-flight**.
+- **Durability** — `nats.Store` implements `CheckpointStore` on a JetStream **stream** (one subject per run, `flow.ckpt.{GraphRunID}`, all revisions retained), preserving the append-only + compare-and-append contract: the server-enforced `ExpectLastSubjectSequence` publish gate makes `(GraphRunID, Revision)` unique, and `GetLastMsgForSubject` is the highest-revision `Latest`. Same interface as `MemStore`.
+- **Distribution & version routing** — workers subscribe to durable consumers on subjects encoding the version. Because `GraphVersion` is an arbitrary user string (not a safe NATS subject token), the route is a **hashed token**: `flow.work.{hex(sha256(GraphID|GraphVersion))}` (the `GraphRunID` rides in the `Work` payload, not the subject). A worker subscribes (`FilterSubjects`) only to the tokens for versions in its registry, so JetStream delivers each version's work to a capable worker — **the version router *is* the subject space**, no separate LB needed.
 - **At-least-once is safe** — JetStream may redeliver; the engine's compare-and-append (`RevisionConflictError`) + task `IdempotencyKey()` (§4.1, §10.2) absorb duplicates.
 - **Local = embedded, cloud = cluster** — an in-process **embedded** JetStream server gives durable, zero-infra **local** runs (looprig's pattern); pointing at a NATS **cluster** gives multi-worker **cloud** scale and rolling version deploys (old/new-version workers coexist on old/new version subjects until old runs drain).
 
@@ -825,7 +825,7 @@ type Delivery struct {
 - **In service/distributed mode, `Run`/`Resume` flow through the control plane** — ingress *submits*; a worker *consumes* and invokes the local `Runner`. (Tier-A *embed* usage, §18.6, skips the control plane and calls `Runner.Run`/`Resume` directly.)
 - **Two impls, mirroring the store:** `controlplane.Mem` (in-process channel — local, ephemeral) and `nats.ControlPlane` (JetStream work streams — durable, distributed). Control plane and `CheckpointStore` are **separate interfaces**, even when both are NATS-backed (two streams).
 - **Registration is implicit:** a worker registers by *consuming* the version subjects it serves (its registry) — no registration RPC.
-- **Single-flight per run** is a control-plane guarantee (per-`GraphRunID` work-queue / max-in-flight 1), with compare-and-append (`RevisionConflictError`) as the backstop.
+- **Single-flight per run** is **best-effort, not the correctness boundary.** The in-process `controlplane.Mem` guarantees it (central dispatcher); the distributed `nats.ControlPlane` provides it at **message granularity** (a work-queue delivers each message once until acked), so two *distinct* messages for one run can run concurrently. That is safe by design: **correctness — no duplicate *committed* effects — is guaranteed by compare-and-append (`RevisionConflictError`, §10.2) + task `IdempotencyKey()` (§4.1)**, which absorb concurrent duplicate work. Control-plane single-flight is only an efficiency optimization (an impl may provide stricter single-flight and still conform — LSP).
 - **Ack / redelivery:** a worker `Ack`s a `Delivery` only once the work reaches a **quiescent result** — `Completed`, `Interrupted`, `Halted`, `Cancelled`, or safely failed-and-requeued — **not** merely after the seed/any checkpoint (`Run` appends a seed checkpoint *before* doing useful work). A crash before `Ack` → the backend redelivers, and compare-and-append + `IdempotencyKey()` absorb the duplicate.
 - **Async-first** (§18.3): ingress pre-mints the `GraphRunID`, submits, and returns `202 + GraphRunID`; read via `GET /runs/{id}` or webhook. Synchronous responses are optional via request/reply.
 
