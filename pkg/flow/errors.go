@@ -266,6 +266,22 @@ func (e *GraphVersionMismatchError) Error() string {
 	return "flow: graph version mismatch: expected " + e.Expected + ", got " + e.Actual
 }
 
+// GraphRunMismatchError reports that a loaded checkpoint's embedded
+// Run.GraphRunID does not match the GraphRunID requested on Resume, so the store
+// returned a checkpoint belonging to a DIFFERENT run. Resuming it would write
+// into the embedded run's history; this fails secure before any task runs
+// (§10.4). Requested is the id passed to Resume; Actual is the checkpoint's
+// embedded Run.GraphRunID.
+type GraphRunMismatchError struct {
+	Requested GraphRunID
+	Actual    GraphRunID
+}
+
+// Error names the requested and actual run identities.
+func (e *GraphRunMismatchError) Error() string {
+	return "flow: graph run mismatch: requested " + e.Requested.String() + ", got " + e.Actual.String()
+}
+
 // GraphRunExistsError reports an attempt to start a run whose GraphRunID already
 // exists in the store (a duplicate start) (§18.2).
 type GraphRunExistsError struct{ GraphRunID GraphRunID }

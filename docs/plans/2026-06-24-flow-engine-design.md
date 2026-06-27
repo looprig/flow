@@ -554,6 +554,7 @@ type Halt struct {
 
 A checkpoint loaded from a `CheckpointStore` is **untrusted input** (CLAUDE.md: validate at every boundary). Before the coordinator acts on it, `Resume` validates and returns a typed engine `error` on any failure — *before any task executes*, so a corrupt or mismatched checkpoint fails fast:
 
+- The loaded checkpoint's embedded `Run.GraphRunID` matches the **requested** `id` → else `GraphRunMismatchError{Requested, Actual}` — a buggy/tampered backend returning another run's checkpoint must not resume into it (every downstream phase keys `finishRanInHistory`/append on the embedded `GraphRunID`, so this runs first, before any task, fail secure).
 - `GraphID` matches the runner's graph → else `GraphMismatchError`; `GraphVersion` matches the compiled graph's fingerprint → else `GraphVersionMismatchError` (§8.1) — **a changed graph cannot resume an old checkpoint**.
 - `StepBase` and `State` decode into `S` → else `CheckpointDecodeError`.
 - Every `Frontier`, `Interrupts[].Vertex`, and `Routes[].From`/`Routes[].To` references a vertex in the compiled graph → else `UnknownVertexError`.
@@ -627,7 +628,7 @@ The `error` return is required for infra failures precisely because a durable in
 
 ### 12.4 Typed errors
 
-All package-level APIs return **typed errors** for `errors.As`: `DuplicateVertexError`, `DuplicateConditionalEdgeError{From}`, `UnknownVertexError`, `UnreachableVertexError`, `AmbiguousRoutingError`, `MissingEntryError`, and `BuildError{Op, Detail}` — the latter the fail-fast guard for malformed *add-time* arguments (nil task/selector/reducer, zero id/endpoint, nil `Pick`, empty `Targets`); uniqueness violations use the `Duplicate*` errors, and whole-graph structural checks use the named errors above (build); `MaxStepsExceededError`, `UndeclaredTargetError`, `DeadEndError`, `ConditionError`, `VertexError{VertexID, VertexRunID, Attempt, Err}` (runtime); `CheckpointDecodeError`, `CheckpointNotFoundError`, `ResumeTerminalError{Status RunStatus}`, `GraphMismatchError`, `GraphVersionMismatchError`, `GraphRunExistsError`, `RevisionConflictError`, `StoreError` (durability/engine). The interrupt signal is an internal typed error detected via `errors.As`.
+All package-level APIs return **typed errors** for `errors.As`: `DuplicateVertexError`, `DuplicateConditionalEdgeError{From}`, `UnknownVertexError`, `UnreachableVertexError`, `AmbiguousRoutingError`, `MissingEntryError`, and `BuildError{Op, Detail}` — the latter the fail-fast guard for malformed *add-time* arguments (nil task/selector/reducer, zero id/endpoint, nil `Pick`, empty `Targets`); uniqueness violations use the `Duplicate*` errors, and whole-graph structural checks use the named errors above (build); `MaxStepsExceededError`, `UndeclaredTargetError`, `DeadEndError`, `ConditionError`, `VertexError{VertexID, VertexRunID, Attempt, Err}` (runtime); `CheckpointDecodeError`, `CheckpointNotFoundError`, `ResumeTerminalError{Status RunStatus}`, `GraphMismatchError`, `GraphVersionMismatchError`, `GraphRunMismatchError{Requested, Actual}`, `GraphRunExistsError`, `RevisionConflictError`, `StoreError` (durability/engine). The interrupt signal is an internal typed error detected via `errors.As`.
 
 ### 12.5 Panic safety for user callbacks
 

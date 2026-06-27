@@ -192,6 +192,15 @@ func TestErrorImplementsError(t *testing.T) {
 			},
 		},
 		{
+			name:  "GraphRunMismatchError",
+			err:   &GraphRunMismatchError{Requested: grid, Actual: GraphRunID{6}},
+			match: []string{grid.String(), GraphRunID{6}.String()},
+			as: func() (any, func(error) bool) {
+				var t *GraphRunMismatchError
+				return &t, func(e error) bool { return errors.As(e, &t) }
+			},
+		},
+		{
 			name:  "GraphRunExistsError",
 			err:   &GraphRunExistsError{GraphRunID: grid},
 			match: []string{grid.String()},

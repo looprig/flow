@@ -41,13 +41,25 @@ import (
 // read (§10.4) MUST bound the payload size and nesting before decoding, to guard
 // against oversized or deeply-nested input (CLAUDE.md: guard against unbounded
 // sizes). MemStore is exempt only because its bytes are self-produced in-memory.
+//
+// CONTRACT (Latest is genuinely the latest, §10.4): Latest MUST return the
+// checkpoint with the HIGHEST Run.Revision for the run. The resume contract
+// (§10.4) depends on the loaded checkpoint being the true latest — Resume
+// continues the append-only sequence from cp.Run.Revision, so a backend that
+// returns a STALE checkpoint would fork or overwrite committed history. A durable
+// backend's conformance test MUST cover this; MemStore guarantees it structurally
+// (it stores the contiguous 0..len-1 revisions and returns the last).
 type CheckpointStore interface {
 	// Append durably records cp iff cp.Run.Revision is the next revision in
 	// sequence for cp.Run.GraphRunID (compare-and-append). Otherwise it returns a
 	// *RevisionConflictError. A serialization failure is a *StoreError.
 	Append(ctx context.Context, cp *Checkpoint) error
 	// Latest returns the highest-revision checkpoint for id (the source of truth),
-	// or a *CheckpointNotFoundError if the run has no checkpoints.
+	// or a *CheckpointNotFoundError if the run has no checkpoints. It MUST return
+	// the checkpoint with the HIGHEST Run.Revision for the run: the §10.4 resume
+	// contract depends on the loaded checkpoint being genuinely the latest, and a
+	// backend that returns a stale revision violates the contract (it would fork or
+	// overwrite committed history on the next append).
 	Latest(ctx context.Context, id GraphRunID) (*Checkpoint, error)
 	// History returns every checkpoint for id ordered by revision (0,1,2,…), or a
 	// *CheckpointNotFoundError if the run has no checkpoints.

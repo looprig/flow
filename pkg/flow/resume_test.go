@@ -286,6 +286,75 @@ func TestResumeCheckpointNotFound(t *testing.T) {
 	}
 }
 
+// runMismatchStore wraps a CheckpointStore and rewrites the EMBEDDED
+// cp.Run.GraphRunID returned by Latest to a different id, simulating a buggy or
+// tampered durable backend that returns a checkpoint belonging to another run
+// under the requested key. A §10.4-conformant Resume must reject this before any
+// task runs (fail secure), never write into the embedded run's history.
+type runMismatchStore struct {
+	CheckpointStore
+	actual GraphRunID // the id to stamp onto the checkpoint Latest returns
+}
+
+func (s *runMismatchStore) Latest(ctx context.Context, id GraphRunID) (*Checkpoint, error) {
+	cp, err := s.CheckpointStore.Latest(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	cp.Run.GraphRunID = s.actual // the loaded checkpoint claims a DIFFERENT run
+	return cp, nil
+}
+
+// TestResumeRejectsGraphRunIDMismatch is the L2 hardening regression (§10.4): a
+// loaded checkpoint whose embedded Run.GraphRunID does not match the requested id
+// is rejected with a typed *GraphRunMismatchError BEFORE any task runs, so a
+// buggy/tampered backend cannot make Resume write into the embedded run's history
+// (fail secure). A side-effect sentinel proves no task executed.
+func TestResumeRejectsGraphRunIDMismatch(t *testing.T) {
+	t.Parallel()
+
+	var ran atomic.Int32
+	mem := NewMemStore()
+	g := NewGraph[cnt](GraphID{})
+	entry := vID(1)
+	addErrVertex(t, g, entry, NewFuncTask(func(ctx context.Context, _ int) (string, error) {
+		ran.Add(1)
+		return "", Interrupt(ctx, "pause")
+	}))
+	r, err := g.Compile(entry, entry, WithStore(mem))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	id := resumeOnce(t, r, mem)
+	ranBefore := ran.Load() // the initial Run ran the task once
+
+	other, err := NewGraphRunID()
+	if err != nil {
+		t.Fatalf("NewGraphRunID: %v", err)
+	}
+	if other == id {
+		t.Fatal("minted id collided with the run id")
+	}
+
+	// Resume against a store whose Latest returns a checkpoint claiming `other`.
+	r2 := *r
+	r2.store = &runMismatchStore{CheckpointStore: mem, actual: other}
+	_, err = r2.Resume(context.Background(), id, "payload")
+
+	var mismatch *GraphRunMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Resume() error = %v, want *GraphRunMismatchError", err)
+	}
+	if mismatch.Requested != id || mismatch.Actual != other {
+		t.Errorf("GraphRunMismatchError = {Requested:%v Actual:%v}, want {Requested:%v Actual:%v}",
+			mismatch.Requested, mismatch.Actual, id, other)
+	}
+	if ran.Load() != ranBefore {
+		t.Errorf("a task ran on a GraphRunID mismatch (ran %d, want %d) — validation must precede execution",
+			ran.Load(), ranBefore)
+	}
+}
+
 // --- StepPaused continuation (the headline) ---------------------------------
 
 // TestResumeStepPausedHeadline proves the core resume path: a graph pauses at an

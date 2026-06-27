@@ -491,6 +491,10 @@ func (c *coordinator[S]) applyErrorRoute(r *vertexRun[S], route *errorRoute[S]) 
 	c.state = next
 	r.vs.Status = VertexFailed
 	r.vs.FailedAt = time.Now()
+	// Carry the failure cause on the per-vertex record so the durable VertexState
+	// (and Get) surfaces it, not only the routing decision (§4.1). Set before the
+	// boundary checkpoint is written so the persisted record carries it.
+	r.vs.Err = r.err.Error()
 	return true
 }
 
@@ -500,6 +504,10 @@ func (c *coordinator[S]) applyErrorRoute(r *vertexRun[S], route *errorRoute[S]) 
 func (c *coordinator[S]) pauseErrored(r *vertexRun[S], out *stepOutcome[S]) {
 	r.vs.Status = VertexFailed
 	r.vs.FailedAt = time.Now()
+	// Carry the failure cause on the per-vertex record so the durable VertexState
+	// (and Get) surfaces it, not only the Errored InterruptRecord.Cause (§4.1). Set
+	// before the per-vertex/boundary checkpoint is written so it is persisted.
+	r.vs.Err = r.err.Error()
 	out.pauses = append(out.pauses, Interruption{
 		GraphRunID: c.rs.GraphRunID,
 		Vertex:     r.vs.VertexID,

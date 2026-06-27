@@ -2222,6 +2222,124 @@ func TestRunRetryExhaustionPause(t *testing.T) {
 	}
 }
 
+// vertexStateFor returns the per-vertex record for v in cp.Vertices, or fails.
+func vertexStateFor(t *testing.T, cp *Checkpoint, v VertexID) VertexState {
+	t.Helper()
+	for _, vs := range cp.Vertices {
+		if vs.VertexID == v {
+			return vs
+		}
+	}
+	t.Fatalf("no VertexState for %v in %+v", v, cp.Vertices)
+	return VertexState{}
+}
+
+// TestVertexFailedPopulatesErr is the L3 hardening regression (§4.1): a failed
+// vertex's per-vertex VertexState.Err carries the failure cause in BOTH error
+// policies — a default-Pause failure (the StepPaused checkpoint's Failed record)
+// and a Failed-under-Route failure (the routing step's Failed record) — while a
+// Done vertex's Err stays empty. The durable VertexState must carry the detail so
+// a backend (and Get) surfaces the per-vertex failure, not just InterruptRecord.
+func TestVertexFailedPopulatesErr(t *testing.T) {
+	t.Parallel()
+
+	t.Run("default-pause failure populates Err", func(t *testing.T) {
+		t.Parallel()
+
+		var counter int32
+		store := NewMemStore()
+		g := NewGraph[cnt](GraphID{})
+		entry := vID(1)
+		addErrVertex(t, g, entry, failTask(99, "never", &counter),
+			WithRetry[cnt](RetryPolicy{MaxAttempts: 1}))
+		r, err := g.Compile(entry, entry, WithStore(store))
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		res, err := r.Run(context.Background(), cnt{})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Run.Status != RunInterrupted {
+			t.Fatalf("Status = %v, want RunInterrupted (default-Pause)", res.Run.Status)
+		}
+		last := lastCheckpoint(t, store, res.Run.GraphRunID)
+		if last.Phase != StepPaused {
+			t.Fatalf("last Phase = %v, want StepPaused", last.Phase)
+		}
+		vs := vertexStateFor(t, last, entry)
+		if vs.Status != VertexFailed {
+			t.Fatalf("entry Status = %v, want VertexFailed", vs.Status)
+		}
+		if vs.Err == "" {
+			t.Error("VertexState.Err is empty on a default-Pause failure, want the cause")
+		}
+		if !strings.Contains(vs.Err, "transient failure") {
+			t.Errorf("VertexState.Err = %q, want it to contain the underlying cause", vs.Err)
+		}
+	})
+
+	t.Run("failed-route failure populates Err and Done stays empty", func(t *testing.T) {
+		t.Parallel()
+
+		var counter int32
+		store := NewMemStore()
+		g := NewGraph[cnt](GraphID{})
+		entry, handler := vID(1), vID(2)
+		record := func(s *cnt, e error) error {
+			s.Vals = append(s.Vals, "recorded:"+e.Error())
+			return nil
+		}
+		addErrVertex(t, g, entry, failTask(99, "never", &counter),
+			WithRetry[cnt](RetryPolicy{MaxAttempts: 1}),
+			WithErrorRoute[cnt](handler, record))
+		addErrVertex(t, g, handler, NewFuncTask(func(_ context.Context, _ int) (string, error) {
+			return "handled", nil
+		}))
+		r, err := g.Compile(entry, handler, WithStore(store))
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		res, err := r.Run(context.Background(), cnt{})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Run.Status != RunCompleted {
+			t.Fatalf("Status = %v, want RunCompleted (routed handler completes)", res.Run.Status)
+		}
+		// The routing step's checkpoint carries the Failed-under-Route entry record.
+		hist, err := store.History(context.Background(), res.Run.GraphRunID)
+		if err != nil {
+			t.Fatalf("History: %v", err)
+		}
+		var failed, done bool
+		for _, cp := range hist {
+			for _, vs := range cp.Vertices {
+				if vs.VertexID == entry && vs.Status == VertexFailed {
+					failed = true
+					if vs.Err == "" {
+						t.Error("Failed-under-Route VertexState.Err is empty, want the cause")
+					} else if !strings.Contains(vs.Err, "transient failure") {
+						t.Errorf("Failed-under-Route VertexState.Err = %q, want the cause", vs.Err)
+					}
+				}
+				if vs.VertexID == handler && vs.Status == VertexDone {
+					done = true
+					if vs.Err != "" {
+						t.Errorf("Done VertexState.Err = %q, want empty", vs.Err)
+					}
+				}
+			}
+		}
+		if !failed {
+			t.Error("no Failed-under-Route record for entry in history")
+		}
+		if !done {
+			t.Error("no Done record for handler in history")
+		}
+	})
+}
+
 // TestRunInterruptAwaitingPause proves flow.Interrupt pauses the vertex as
 // Awaiting: Result.Interrupts carries the user Info, StepPaused, OnInterrupt once,
 // NOT an engine error.

@@ -46,7 +46,7 @@ func (r *Runner[S]) Resume(ctx context.Context, id GraphRunID, payload any, opts
 	if err != nil {
 		return nil, err
 	}
-	state, err := r.validateCheckpoint(cp)
+	state, err := r.validateCheckpoint(id, cp)
 	if err != nil {
 		return nil, err
 	}
@@ -58,10 +58,12 @@ func (r *Runner[S]) Resume(ctx context.Context, id GraphRunID, payload any, opts
 // validateCheckpoint runs every §10.4 rule against the loaded (untrusted)
 // checkpoint and returns the decoded state S on success, or the first typed
 // validation error. It is the sole trust boundary for a resumed checkpoint: it
-// must run to completion before any task executes (fail secure).
-func (r *Runner[S]) validateCheckpoint(cp *Checkpoint) (S, error) {
+// must run to completion before any task executes (fail secure). id is the run
+// requested on Resume; validateIdentity verifies the loaded checkpoint belongs to
+// it before any downstream phase keys history/appends on the embedded GraphRunID.
+func (r *Runner[S]) validateCheckpoint(id GraphRunID, cp *Checkpoint) (S, error) {
 	var zero S
-	if err := r.validateIdentity(cp); err != nil {
+	if err := r.validateIdentity(id, cp); err != nil {
 		return zero, err
 	}
 	if err := r.validateNotTerminal(cp); err != nil {
@@ -80,11 +82,17 @@ func (r *Runner[S]) validateCheckpoint(cp *Checkpoint) (S, error) {
 	return state, nil
 }
 
-// validateIdentity enforces the §10.4 graph identity and version rules: the
-// checkpoint must belong to this compiled graph (GraphMismatchError) and match its
-// fingerprint (GraphVersionMismatchError) — a changed graph cannot resume an old
-// checkpoint.
-func (r *Runner[S]) validateIdentity(cp *Checkpoint) error {
+// validateIdentity enforces the §10.4 graph and run identity and version rules:
+// the loaded checkpoint must belong to the REQUESTED run (GraphRunMismatchError —
+// a buggy/tampered backend returning another run's checkpoint must not resume into
+// it), to this compiled graph (GraphMismatchError), and match its fingerprint
+// (GraphVersionMismatchError) — a changed graph cannot resume an old checkpoint.
+// The run-identity check runs first so a mismatched checkpoint fails secure before
+// any downstream phase keys finishRanInHistory/append on the embedded GraphRunID.
+func (r *Runner[S]) validateIdentity(id GraphRunID, cp *Checkpoint) error {
+	if cp.Run.GraphRunID != id {
+		return &GraphRunMismatchError{Requested: id, Actual: cp.Run.GraphRunID}
+	}
 	if cp.Run.GraphID != r.GraphID() {
 		return &GraphMismatchError{Expected: r.GraphID(), Actual: cp.Run.GraphID}
 	}
