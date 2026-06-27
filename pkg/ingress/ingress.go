@@ -43,8 +43,9 @@ const DefaultMaxBodyBytes int64 = 1 << 20
 // config is the resolved ingress configuration assembled from Options. It is
 // unexported: callers build it through functional Options, never by naming fields.
 type config struct {
-	maxBodyBytes int64
-	authn        func(*http.Request) error // nil = no auth (documented default)
+	maxBodyBytes  int64
+	authn         func(*http.Request) error // nil = no auth (documented default)
+	verboseErrors bool                      // WithVerboseErrors: surface raw task/halt causes (default OFF)
 }
 
 // Option configures the ingress handler at New (§18.3). It is the functional-
@@ -75,6 +76,18 @@ func WithAuth(authn func(*http.Request) error) Option {
 			c.authn = authn
 		}
 	}
+}
+
+// WithVerboseErrors surfaces the RAW task/halt error strings in a GET /v1/runs/{id}
+// response (M1). It is OFF by default (fail secure): an Errored interruption's
+// Cause and a Halt's Cause are a task's own error message, which can carry PII or
+// payload fragments, and GET is a WIRE BOUNDARY — by default the handler renders a
+// generic, non-leaking token (the interrupt/halt kind) instead. Enable this ONLY in
+// a trusted/debug deployment where the raw cause is acceptable on the wire. Task
+// error messages should never carry secrets regardless (CLAUDE.md: no secrets on
+// the wire).
+func WithVerboseErrors() Option {
+	return func(c *config) { c.verboseErrors = true }
 }
 
 // handler is the ingress http.Handler: it owns the registry, control plane, and
@@ -221,6 +234,12 @@ func (h *handler) startRun(w http.ResponseWriter, r *http.Request) {
 // the registry to serve that version — no match is 409 + X-Graph-Version (the
 // run's version). It then reads+bounds the resume-payload body and submits an
 // OpResume Work, returning 202 + the GraphRunID and graphVersion.
+//
+// H1c — terminal precheck: a run in a TERMINAL status (Completed/Cancelled) can
+// NEVER resume, so the handler returns 409 WITHOUT submitting OpResume Work. This
+// closes the external trigger for the poison-message spin at the boundary: a
+// doomed OpResume is never enqueued (belt-and-suspenders with the worker's
+// settle-permanent-Ack, §18.5). The body is the sanitized generic token.
 func (h *handler) resumeRun(w http.ResponseWriter, r *http.Request) {
 	id, err := parseRunID(r.PathValue("id"))
 	if err != nil {
@@ -230,6 +249,11 @@ func (h *handler) resumeRun(w http.ResponseWriter, r *http.Request) {
 	run, err := h.loadRun(r.Context(), id)
 	if err != nil {
 		writeMappedError(w, err)
+		return
+	}
+	if run.Status == flow.RunCompleted || run.Status == flow.RunCancelled {
+		// Terminal run: a resume can never succeed; do not enqueue doomed work (H1c).
+		writeError(w, http.StatusConflict, "run is in a terminal state")
 		return
 	}
 	hdl, ok := h.reg.Resolve(run.GraphID, run.GraphVersion)
@@ -286,7 +310,7 @@ func (h *handler) getRun(w http.ResponseWriter, r *http.Request) {
 		writeMappedError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, newRunResultDTO(res))
+	writeJSON(w, http.StatusOK, newRunResultDTO(res, h.cfg.verboseErrors))
 }
 
 // cancelRun answers POST /v1/runs/{id}/cancel (§18.3): it parses the run id,

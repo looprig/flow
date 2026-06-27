@@ -45,8 +45,10 @@ type runResultDTO struct {
 
 // interruptionDTO is the JSON-friendly form of a flow.Interruption (§18.3): Info
 // is the raw reason JSON (best-effort, as the engine reconstructs it from the
-// checkpoint), and Cause is the error message as a plain string (a flow.Halt /
-// Interruption Cause is a Go error, which does not marshal usefully on its own).
+// checkpoint), and Cause is a string describing the failure. By DEFAULT (M1) Cause
+// is a GENERIC, non-leaking token (the interrupt kind, e.g. "errored") — a task's
+// raw error message can carry PII/payloads and GET is a wire boundary; the raw
+// cause is surfaced only under WithVerboseErrors (a trusted/debug deployment).
 type interruptionDTO struct {
 	Vertex string          `json:"vertex"`
 	Kind   string          `json:"kind"`
@@ -55,7 +57,8 @@ type interruptionDTO struct {
 }
 
 // haltDTO is the JSON-friendly form of a flow.Halt (§18.3): the structural kind,
-// the super-step, and the cause message as a plain string.
+// the super-step, and a cause string. By DEFAULT (M1) Cause is the generic halt
+// kind (e.g. "condition"); the raw cause is surfaced only under WithVerboseErrors.
 type haltDTO struct {
 	Kind  string `json:"kind"`
 	Step  int    `json:"step"`
@@ -64,9 +67,12 @@ type haltDTO struct {
 
 // newRunResultDTO converts a *flow.RunResult to its wire DTO (§18.3): it lifts
 // graphVersion to the top level, passes the already-marshaled State through, and
-// renders interrupts/halt with their error causes as strings. A nil res yields a
-// zero DTO (defensive — the handler only calls this on a non-nil Get result).
-func newRunResultDTO(res *flow.RunResult) runResultDTO {
+// renders interrupts/halt. The verbose flag (WithVerboseErrors, default false)
+// controls whether a raw task/halt error string is surfaced (M1): by default a
+// generic, non-leaking token is rendered instead, since a task's error message can
+// carry PII/payloads and GET is a wire boundary. A nil res yields a zero DTO
+// (defensive — the handler only calls this on a non-nil Get result).
+func newRunResultDTO(res *flow.RunResult, verbose bool) runResultDTO {
 	if res == nil {
 		return runResultDTO{}
 	}
@@ -74,12 +80,12 @@ func newRunResultDTO(res *flow.RunResult) runResultDTO {
 		GraphVersion: res.Run.GraphVersion,
 		Run:          res.Run,
 		State:        res.State,
-		Halt:         haltToDTO(res.Halt),
+		Halt:         haltToDTO(res.Halt, verbose),
 	}
 	if len(res.Interrupts) > 0 {
 		out.Interrupts = make([]interruptionDTO, len(res.Interrupts))
 		for i, iv := range res.Interrupts {
-			out.Interrupts[i] = interruptionToDTO(iv)
+			out.Interrupts[i] = interruptionToDTO(iv, verbose)
 		}
 	}
 	return out
@@ -88,17 +94,32 @@ func newRunResultDTO(res *flow.RunResult) runResultDTO {
 // interruptionToDTO renders one flow.Interruption as its wire DTO (§18.3). Info
 // is the engine's serialization-boundary any; when it is the reconstructed raw
 // JSON (json.RawMessage) it is passed through, otherwise it is best-effort
-// re-marshaled. Cause is rendered as its message string (nil -> "").
-func interruptionToDTO(iv flow.Interruption) interruptionDTO {
+// re-marshaled. Cause defaults to a GENERIC token (M1): for an Errored interrupt
+// the kind name ("errored") — NEVER the raw iv.Cause.Error(), which can leak
+// PII/payloads on the wire. Only verbose surfaces the raw cause.
+func interruptionToDTO(iv flow.Interruption, verbose bool) interruptionDTO {
 	dto := interruptionDTO{
 		Vertex: iv.Vertex.String(),
 		Kind:   interruptKindString(iv.Kind),
 	}
 	dto.Info = infoToRaw(iv.Info)
-	if iv.Cause != nil {
-		dto.Cause = iv.Cause.Error()
-	}
+	dto.Cause = causeString(iv.Cause, dto.Kind, verbose)
 	return dto
+}
+
+// causeString renders an error cause for the wire (M1): under verbose it is the
+// raw err.Error() (trusted/debug deployments); by default it is the supplied
+// generic token (the interrupt/halt kind), so a task's error message — which can
+// carry PII/payloads — never crosses the wire boundary. A nil cause yields "" (the
+// field is omitted) regardless of mode.
+func causeString(cause error, generic string, verbose bool) string {
+	if cause == nil {
+		return ""
+	}
+	if verbose {
+		return cause.Error()
+	}
+	return generic
 }
 
 // infoToRaw renders an Interruption.Info serialization-boundary value as raw JSON
@@ -120,15 +141,14 @@ func infoToRaw(info any) json.RawMessage {
 }
 
 // haltToDTO renders a *flow.Halt as its wire DTO, or nil for a nil halt (§18.3).
-func haltToDTO(h *flow.Halt) *haltDTO {
+// Cause defaults to the generic halt kind (M1); only verbose surfaces the raw
+// h.Cause.Error(), which can leak PII/payloads on the wire.
+func haltToDTO(h *flow.Halt, verbose bool) *haltDTO {
 	if h == nil {
 		return nil
 	}
-	dto := &haltDTO{Kind: haltKindString(h.Kind), Step: int(h.Step)}
-	if h.Cause != nil {
-		dto.Cause = h.Cause.Error()
-	}
-	return dto
+	kind := haltKindString(h.Kind)
+	return &haltDTO{Kind: kind, Step: int(h.Step), Cause: causeString(h.Cause, kind, verbose)}
 }
 
 // interruptKindString renders an InterruptKind as a stable wire token (§18.3). An

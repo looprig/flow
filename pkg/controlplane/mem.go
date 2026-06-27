@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/ciram-co/flow/pkg/flow"
 )
@@ -36,10 +37,23 @@ import (
 // Single-flight per run (§18.5). The dispatcher delivers a Work only if NO other
 // Work for the same GraphRunID is already in flight (delivered, not yet
 // Ack/Nack'd). It records the run id in inFlight on delivery; Ack releases the
-// slot and drops the Work; Nack releases the slot and re-enqueues the Work for
-// redelivery. Releasing a slot re-runs dispatch, so a held Work for that run (or
-// the requeued one) flows out next. Different runs are independent, so they can be
-// in flight concurrently.
+// slot and drops the Work; Nack releases the slot and SCHEDULES the Work's requeue
+// after a small backoff (below). Releasing a slot re-runs dispatch, so a held Work
+// for that run (or a requeued one) flows out next. Different runs are independent,
+// so they can be in flight concurrently.
+//
+// Nack backoff (H1b — bounded-rate retry, defense-in-depth). A Nack does NOT
+// re-enqueue synchronously: an immediately-requeued Work whose dependency is
+// transiently failing (store down) would become a 100%-CPU hot loop — the work is
+// re-delivered as fast as the worker can Nack it. Instead the dispatcher arms a
+// time.AfterFunc(nackBackoff) whose callback sends the work onto the internal
+// requeues channel (which the dispatcher selects on, appending to pending). This
+// converts a spin into a bounded-rate retry. The pending timers are owned by the
+// dispatcher (tracked in dispState); on shutdown it Stops them so none fires after
+// Close, and every timer callback's send selects on the lifetime ctx so a
+// fired-during-shutdown timer neither blocks nor leaks (its requeue is simply
+// dropped — the ephemeral plane abandons in-flight work on Close, the durable
+// checkpoint is intact).
 //
 // Routing / implicit registration (§18.5). A consumer registers by Consuming the
 // version keys it serves; the dispatcher delivers a Work only to a registered
@@ -50,6 +64,28 @@ import (
 // when a single consumer's Consume ctx is done that one consumer is unregistered
 // and its channel closed. Either way there is no goroutine leak.
 
+// DefaultNackBackoff is the base delay before a Nack'd Work is requeued (H1b),
+// unless WithNackBackoff overrides it. It is small enough to be invisible to a
+// healthy worker yet large enough to convert a transiently-failing dependency's
+// redelivery from a 100%-CPU spin into a bounded-rate retry.
+const DefaultNackBackoff = 2 * time.Millisecond
+
+// MemOption configures a MemControlPlane at construction (§18.5). It is the
+// functional-options seam (CLAUDE.md: wire dependencies at the composition root);
+// a new knob is a new MemOption with zero edits to existing callers (open/closed).
+type MemOption func(*MemControlPlane)
+
+// WithNackBackoff sets the base delay before a Nack'd Work is requeued (H1b). A
+// value <= 0 is ignored (DefaultNackBackoff stays in force), so a caller cannot
+// accidentally disable the spin guard and reintroduce the hot-loop.
+func WithNackBackoff(d time.Duration) MemOption {
+	return func(cp *MemControlPlane) {
+		if d > 0 {
+			cp.nackBackoff = d
+		}
+	}
+}
+
 // MemControlPlane is the in-process, channel-based control plane (§18.5). It is
 // local and ephemeral: enqueued Work lives only in memory and is lost on process
 // exit (durability is the CheckpointStore's job, separate). Construct it with Mem.
@@ -57,11 +93,22 @@ type MemControlPlane struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	nackBackoff time.Duration // base delay before a Nack'd Work is requeued (H1b)
+
 	submits     chan submitReq  // Submit -> dispatcher
 	consumes    chan consumeReq // Consume -> dispatcher (register a consumer)
 	releases    chan releaseReq // Ack/Nack -> dispatcher (free a run's slot)
+	requeues    chan requeueReq // a backoff timer -> dispatcher: re-enqueue this Work (H1b)
 	deregisters chan int        // a consumer watcher -> dispatcher: this consumer's ctx is done
 	done        chan struct{}   // closed when the dispatcher has fully exited
+}
+
+// requeueReq carries a Nack'd Work back to the dispatcher after its backoff timer
+// fires (H1b). timerID identifies the firing timer so the dispatcher can drop it
+// from its pending-timer set (the timer has fired and its goroutine is exiting).
+type requeueReq struct {
+	timerID int
+	work    flow.Work
 }
 
 // submitReq carries one Submit onto the dispatcher with a reply channel for the
@@ -118,17 +165,23 @@ func (c *consumer) servesKey(k flow.GraphVersionKey) bool {
 // *MemControlPlane runs a background dispatcher goroutine bound to a fresh
 // lifetime ctx; the dispatcher exits (closing all consumer channels) when that
 // ctx is cancelled — see Close. Submit/Consume ctxs passed to the methods scope
-// individual calls/subscriptions and are independent of the lifetime ctx.
-func Mem() *MemControlPlane {
+// individual calls/subscriptions and are independent of the lifetime ctx. Options
+// (e.g. WithNackBackoff) tune behavior at the composition root.
+func Mem(opts ...MemOption) *MemControlPlane {
 	ctx, cancel := context.WithCancel(context.Background())
 	cp := &MemControlPlane{
 		ctx:         ctx,
 		cancel:      cancel,
+		nackBackoff: DefaultNackBackoff,
 		submits:     make(chan submitReq),
 		consumes:    make(chan consumeReq),
 		releases:    make(chan releaseReq),
+		requeues:    make(chan requeueReq),
 		deregisters: make(chan int),
 		done:        make(chan struct{}),
+	}
+	for _, opt := range opts {
+		opt(cp)
 	}
 	go cp.dispatch()
 	return cp
@@ -205,6 +258,9 @@ type dispState struct {
 	inFlight  map[flow.GraphRunID]struct{} // runs with a Work currently delivered (single-flight)
 	consumers map[int]*consumer            // id -> registered consumer
 	nextID    int
+
+	backoffTimers map[int]*time.Timer // armed Nack-backoff timers (H1b), id -> timer
+	nextTimerID   int
 }
 
 // dispatch is the single owner goroutine: it serializes every state mutation and
@@ -214,8 +270,9 @@ func (cp *MemControlPlane) dispatch() {
 	defer close(cp.done)
 
 	st := &dispState{
-		inFlight:  make(map[flow.GraphRunID]struct{}),
-		consumers: make(map[int]*consumer),
+		inFlight:      make(map[flow.GraphRunID]struct{}),
+		consumers:     make(map[int]*consumer),
+		backoffTimers: make(map[int]*time.Timer),
 	}
 
 	for {
@@ -226,9 +283,7 @@ func (cp *MemControlPlane) dispatch() {
 
 		select {
 		case <-cp.ctx.Done():
-			for id := range st.consumers {
-				cp.removeConsumer(st, id)
-			}
+			cp.shutdown(st)
 			return
 
 		case req := <-cp.submits:
@@ -242,11 +297,49 @@ func (cp *MemControlPlane) dispatch() {
 			cp.removeConsumer(st, id)
 
 		case rel := <-cp.releases:
-			delete(st.inFlight, rel.run)
-			if rel.kind == relNack {
-				st.pending = append(st.pending, rel.work) // requeue for redelivery
-			}
+			cp.release(st, rel)
+
+		case rq := <-cp.requeues:
+			delete(st.backoffTimers, rq.timerID) // timer fired; forget it
+			st.pending = append(st.pending, rq.work)
 		}
+	}
+}
+
+// release applies one Ack/Nack: it frees the run's single-flight slot and, on a
+// Nack, ARMS a backoff timer to requeue the work after nackBackoff rather than
+// re-enqueuing synchronously (H1b — converts a transiently-failing item's
+// redelivery from a spin into a bounded-rate retry). The timer is tracked in
+// dispState so shutdown can Stop it; its callback selects on the lifetime ctx so a
+// fired-during-shutdown timer neither blocks nor leaks. Only the dispatcher calls
+// release, so the state mutation is race-free.
+func (cp *MemControlPlane) release(st *dispState, rel releaseReq) {
+	delete(st.inFlight, rel.run)
+	if rel.kind != relNack {
+		return
+	}
+	id := st.nextTimerID
+	st.nextTimerID++
+	w := rel.work
+	timer := time.AfterFunc(cp.nackBackoff, func() {
+		select {
+		case cp.requeues <- requeueReq{timerID: id, work: w}:
+		case <-cp.ctx.Done(): // shutting down: drop the requeue (ephemeral plane)
+		}
+	})
+	st.backoffTimers[id] = timer
+}
+
+// shutdown tears the dispatcher down: it Stops every armed backoff timer (so none
+// fires after Close — no lingering timer goroutine, no requeue into a dead plane)
+// and closes every consumer's Delivery channel. Only the dispatcher calls it, on
+// the lifetime ctx being done.
+func (cp *MemControlPlane) shutdown(st *dispState) {
+	for _, t := range st.backoffTimers {
+		t.Stop()
+	}
+	for id := range st.consumers {
+		cp.removeConsumer(st, id)
 	}
 }
 
@@ -339,10 +432,11 @@ func (cp *MemControlPlane) send(st *dispState, c *consumer, w flow.Work) bool {
 			}
 
 		case rel := <-cp.releases:
-			delete(st.inFlight, rel.run)
-			if rel.kind == relNack {
-				st.pending = append(st.pending, rel.work)
-			}
+			cp.release(st, rel)
+
+		case rq := <-cp.requeues:
+			delete(st.backoffTimers, rq.timerID)
+			st.pending = append(st.pending, rq.work)
 		}
 	}
 }

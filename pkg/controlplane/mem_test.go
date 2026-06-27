@@ -280,6 +280,66 @@ func TestNackRequeues(t *testing.T) {
 	}
 }
 
+// TestNackBackoffBoundsRate is the H1b defense-in-depth regression: a repeatedly-
+// Nack'd Work must be requeued AFTER a small backoff delay, not instantly. Without
+// a delay a transiently-failing dependency turns redelivery into a 100%-CPU hot
+// loop (the Work is re-delivered as fast as the worker can Nack it). The test Nacks
+// the same Work several times and asserts the total elapsed time reflects a per-
+// redelivery delay (a bounded rate), proving the requeue is not instantaneous.
+func TestNackBackoffBoundsRate(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// An explicit (and larger) backoff makes the rate-bound assertion deterministic
+	// and also exercises the WithNackBackoff option seam.
+	const backoff = 5 * time.Millisecond
+	cp := controlplane.Mem(controlplane.WithNackBackoff(backoff))
+	defer cp.Close()
+	k := gvk(7, "v1")
+	run := runID(7)
+	ch, err := cp.Consume(ctx, []flow.GraphVersionKey{k})
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+
+	if err := cp.Submit(ctx, work(k, run, `{"attempt":1}`)); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	// Nack the work several times; each requeue must wait out a backoff before the
+	// next delivery, so N nacks take at least roughly (N-1) * base delay.
+	const nacks = 5
+	start := time.Now()
+	for i := 0; i < nacks; i++ {
+		d := recv(t, ch)
+		if d.Work.GraphRunID != run {
+			t.Fatalf("redelivery #%d run = %s, want %s", i, d.Work.GraphRunID, run)
+		}
+		if err := d.Nack(); err != nil {
+			t.Fatalf("Nack #%d: %v", i, err)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// A spin (immediate requeue) would complete in well under a millisecond. A
+	// bounded backoff makes the same loop take at least roughly (N-1) * backoff. Use
+	// half the nominal total as a conservative lower bound so the assertion is not
+	// flaky on a busy CI box while still failing decisively against a spin.
+	wantMin := time.Duration(nacks-1) * backoff / 2
+	if elapsed < wantMin {
+		t.Errorf("elapsed %v for %d nacks, want >= %v (a Nack must back off, not spin)", elapsed, nacks, wantMin)
+	}
+
+	// The work must still be redeliverable (the backoff must not drop it).
+	d := recv(t, ch)
+	if d.Work.GraphRunID != run {
+		t.Errorf("final redelivery run = %s, want %s", d.Work.GraphRunID, run)
+	}
+	_ = d.Ack()
+}
+
 // TestDifferentRunsConcurrent proves single-flight is PER RUN, not global: Works
 // for two DIFFERENT GraphRunIDs can be in flight simultaneously.
 func TestDifferentRunsConcurrent(t *testing.T) {

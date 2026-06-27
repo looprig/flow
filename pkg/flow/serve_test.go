@@ -310,6 +310,99 @@ func TestServeDuplicateOpRunIdempotentAck(t *testing.T) {
 	}
 }
 
+// countingControlPlane wraps a flow.ControlPlane and counts how many times each
+// GraphRunID is DELIVERED to a consumer, so a test can prove a permanent-error Work
+// is not redelivered hundreds of times (the H1 poison-message DoS). It is a thin
+// pass-through that observes the Delivery stream; Submit/Consume/Ack/Nack semantics
+// are unchanged.
+type countingControlPlane struct {
+	inner      flow.ControlPlane
+	mu         sync.Mutex
+	deliveries map[flow.GraphRunID]int
+}
+
+func newCountingControlPlane(inner flow.ControlPlane) *countingControlPlane {
+	return &countingControlPlane{inner: inner, deliveries: make(map[flow.GraphRunID]int)}
+}
+
+func (c *countingControlPlane) Submit(ctx context.Context, w flow.Work) error {
+	return c.inner.Submit(ctx, w)
+}
+
+func (c *countingControlPlane) Consume(ctx context.Context, serves []flow.GraphVersionKey) (<-chan flow.Delivery, error) {
+	in, err := c.inner.Consume(ctx, serves)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan flow.Delivery)
+	go func() {
+		defer close(out)
+		for d := range in {
+			c.mu.Lock()
+			c.deliveries[d.Work.GraphRunID]++
+			c.mu.Unlock()
+			select {
+			case out <- d:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
+func (c *countingControlPlane) count(id flow.GraphRunID) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deliveries[id]
+}
+
+// TestServePoisonMessageBounded is the H1 poison-message regression: an OpResume on
+// an ALREADY-COMPLETED run yields a PERMANENT *ResumeTerminalError that can NEVER
+// succeed on redelivery. Before the fix settle Nacked it, so the control plane
+// redelivered it forever — a 100%-CPU hot loop an external caller could trigger.
+// After the fix settle Ack-and-abandons it, so the run is delivered a BOUNDED
+// number of times (effectively once) and the plane goes quiet.
+func TestServePoisonMessageBounded(t *testing.T) {
+	t.Parallel()
+
+	h := flow.NewRunnerHandle(newServeIncRunner(t))
+	reg := servedRegistry(t, h)
+	inner := controlplane.Mem()
+	t.Cleanup(inner.Close)
+	cp := newCountingControlPlane(inner)
+
+	startServe(t, reg, cp)
+
+	// Drive a run to completion directly so a later OpResume is terminal.
+	done, err := h.Run(context.Background(), json.RawMessage(`{"n":0}`))
+	if err != nil {
+		t.Fatalf("seed Run: %v", err)
+	}
+	if done.Run.Status != flow.RunCompleted {
+		t.Fatalf("seed Run.Status = %v, want RunCompleted", done.Run.Status)
+	}
+	id := done.Run.GraphRunID
+
+	// Submit an OpResume on the completed run: a permanent ResumeTerminalError.
+	w := flow.Work{
+		Key:        keyFor(h),
+		GraphRunID: id,
+		Op:         flow.OpResume,
+		Input:      json.RawMessage(`{"n":1}`),
+	}
+	if err := cp.Submit(context.Background(), w); err != nil {
+		t.Fatalf("Submit poison: %v", err)
+	}
+
+	// Give the worker ample time to (mis)behave. A Nack loop would rack up many
+	// hundreds of redeliveries in this window; an Ack-and-abandon caps it.
+	time.Sleep(200 * time.Millisecond)
+	if got := cp.count(id); got > 3 {
+		t.Errorf("poison Work delivered %d times, want bounded (<=3) — redelivery spin", got)
+	}
+}
+
 // TestServeCtxCancelGracefulStop proves cancelling ctx closes the Consume channel,
 // Serve returns ctx.Err() (context.Canceled), and no goroutine is left running.
 func TestServeCtxCancelGracefulStop(t *testing.T) {

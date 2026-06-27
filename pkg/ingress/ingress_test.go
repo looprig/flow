@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -865,6 +866,247 @@ func TestCancelMalformedBody(t *testing.T) {
 		t.Fatalf("malformed cancel: status = %d, want 400; body=%s", status, body)
 	}
 	assertErrorBody(t, body)
+}
+
+// recordingControlPlane wraps a flow.ControlPlane and records the Op of every
+// Submitted Work, so a test can prove the ingress did (or did not) submit a given
+// op. It is a thin pass-through; delivery/ack semantics are unchanged.
+type recordingControlPlane struct {
+	inner flow.ControlPlane
+	mu    sync.Mutex
+	ops   []flow.WorkOp
+}
+
+func newRecordingControlPlane(inner flow.ControlPlane) *recordingControlPlane {
+	return &recordingControlPlane{inner: inner}
+}
+
+func (c *recordingControlPlane) Submit(ctx context.Context, w flow.Work) error {
+	c.mu.Lock()
+	c.ops = append(c.ops, w.Op)
+	c.mu.Unlock()
+	return c.inner.Submit(ctx, w)
+}
+
+func (c *recordingControlPlane) Consume(ctx context.Context, serves []flow.GraphVersionKey) (<-chan flow.Delivery, error) {
+	return c.inner.Consume(ctx, serves)
+}
+
+func (c *recordingControlPlane) submittedOps() []flow.WorkOp {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]flow.WorkOp, len(c.ops))
+	copy(out, c.ops)
+	return out
+}
+
+// newErroringRunner compiles a one-vertex Runner whose task returns a plain error
+// (default Pause-on-error policy), so the run pauses as an Errored interruption
+// carrying that error as its Cause. The error message embeds secret so a test can
+// assert it is (not) leaked on the wire.
+func newErroringRunner(t *testing.T, gid flow.GraphID, store flow.CheckpointStore, secret string) *flow.Runner[ixState] {
+	t.Helper()
+	entry := ixVID(1)
+	g := flow.NewGraph[ixState](gid)
+	task := flow.NewFuncTask(func(_ context.Context, _ int) (int, error) {
+		return 0, newTestError(secret)
+	})
+	sel := func(s ixState) int { return s.N }
+	red := func(s *ixState, out int) error { s.N = out; return nil }
+	if err := flow.AddVertex(g, entry, task, sel, red); err != nil {
+		t.Fatalf("AddVertex: %v", err)
+	}
+	r, err := g.Compile(entry, entry, flow.WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	return r
+}
+
+// TestResumeTerminalRunConflict is the H1c regression: POST resume on a TERMINAL
+// run (Completed or Cancelled) must return 409 WITHOUT submitting an OpResume Work
+// — a terminal run can never resume, so the handler must not enqueue doomed work
+// (the external trigger for the poison-message spin). It records the submitted ops
+// and asserts no OpResume was enqueued.
+func TestResumeTerminalRunConflict(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		drive    func(t *testing.T, h flow.RunnerHandle, id flow.GraphRunID)
+		wantStat string
+	}{
+		{
+			name: "completed run",
+			drive: func(t *testing.T, h flow.RunnerHandle, id flow.GraphRunID) {
+				waitForHandleStatus(t, h, id, flow.RunCompleted)
+			},
+			wantStat: "Completed",
+		},
+		{
+			name: "cancelled run",
+			drive: func(t *testing.T, h flow.RunnerHandle, id flow.GraphRunID) {
+				// Wait for the run to pause (so it has a checkpoint) before cancelling.
+				waitForHandleStatus(t, h, id, flow.RunInterrupted)
+				if err := h.Cancel(context.Background(), id, "operator"); err != nil {
+					t.Fatalf("Cancel: %v", err)
+				}
+			},
+			wantStat: "Cancelled",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gid := ixGID(50)
+			store := flow.NewMemStore()
+			// A resumable runner so a started run pauses; for the completed case we
+			// instead use an inc runner driven to completion. Use inc for completed,
+			// resumable (then cancel) for cancelled.
+			var h flow.RunnerHandle
+			if tt.wantStat == "Completed" {
+				h = flow.NewRunnerHandle(newIncRunner(t, gid, store))
+			} else {
+				h = flow.NewRunnerHandle(newResumableRunner(t, gid, store))
+			}
+			reg := servedRegistry(t, h)
+
+			inner := controlplane.Mem()
+			t.Cleanup(inner.Close)
+			rec := newRecordingControlPlane(inner)
+			startServe(t, reg, rec)
+			handler := ingress.New(reg, rec, store)
+			srv := httptest.NewServer(handler)
+			t.Cleanup(srv.Close)
+
+			// Start the run via the ingress so an OpRun is the only submit so far.
+			status, body := postJSON(t, srv.URL+"/v1/graphs/"+gid.String()+"/runs", `{"n":0}`, nil)
+			if status != http.StatusAccepted {
+				t.Fatalf("start: status = %d, want 202; body=%s", status, body)
+			}
+			var sr startResp
+			if err := json.Unmarshal(body, &sr); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			runID, perr := parseRunIDForTest(sr.GraphRunID)
+			if perr != nil {
+				t.Fatalf("parse run id: %v", perr)
+			}
+			tt.drive(t, h, runID)
+
+			// Resume the terminal run -> 409, no OpResume submitted.
+			status, body = postJSON(t, srv.URL+"/v1/runs/"+sr.GraphRunID+"/resume", `{"n":1}`, nil)
+			if status != http.StatusConflict {
+				t.Fatalf("resume terminal: status = %d, want 409; body=%s", status, body)
+			}
+			assertErrorBody(t, body)
+
+			for _, op := range rec.submittedOps() {
+				if op == flow.OpResume {
+					t.Errorf("an OpResume Work was submitted for a terminal run; want none (ops=%v)", rec.submittedOps())
+				}
+			}
+		})
+	}
+}
+
+// parseRunIDForTest parses a run id string the same way the ingress does, for the
+// terminal-resume test (which needs the typed id to drive the handle directly).
+func parseRunIDForTest(s string) (flow.GraphRunID, error) {
+	var id flow.GraphRunID
+	if err := id.UnmarshalText([]byte(s)); err != nil {
+		return flow.GraphRunID{}, err
+	}
+	return id, nil
+}
+
+// waitForHandleStatus polls h.Status until it reaches want, for the H1c completed
+// case (driven by the worker through the ingress submit).
+func waitForHandleStatus(t *testing.T, h flow.RunnerHandle, id flow.GraphRunID, want flow.RunStatus) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		st, err := h.Status(context.Background(), id)
+		if err == nil && st.Status == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run %s did not reach %v in time (last err=%v)", id, want, err)
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+}
+
+// TestGetErroredRunDoesNotLeakCause is the M1 regression: a run paused at an
+// Errored interrupt whose task error embeds a secret must NOT leak that secret on
+// GET /v1/runs/{id} by DEFAULT — the cause is rendered as a generic token. With
+// WithVerboseErrors() (opt-in, for trusted/debug deployments) the raw cause IS
+// surfaced. Task error messages are a wire boundary; secrets must not ride there.
+func TestGetErroredRunDoesNotLeakCause(t *testing.T) {
+	t.Parallel()
+
+	const secret = "SECRET-do-not-leak-payload-9f3a"
+
+	tests := []struct {
+		name       string
+		verbose    bool
+		wantSecret bool
+	}{
+		{name: "default hides cause", verbose: false, wantSecret: false},
+		{name: "verbose surfaces cause", verbose: true, wantSecret: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gid := ixGID(51)
+			store := flow.NewMemStore()
+			h := flow.NewRunnerHandle(newErroringRunner(t, gid, store, secret))
+			reg := servedRegistry(t, h)
+
+			var opts []ingress.Option
+			if tt.verbose {
+				opts = append(opts, ingress.WithVerboseErrors())
+			}
+			srv, _ := newTestServer(t, reg, store, opts...)
+
+			status, body := postJSON(t, srv.URL+"/v1/graphs/"+gid.String()+"/runs", `{"n":0}`, nil)
+			if status != http.StatusAccepted {
+				t.Fatalf("start: status = %d, want 202; body=%s", status, body)
+			}
+			var sr startResp
+			if err := json.Unmarshal(body, &sr); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			// The run pauses Errored.
+			got := pollRun(t, srv, sr.GraphRunID, "Interrupted")
+
+			// Fetch the raw GET body so we can check the exact bytes on the wire.
+			resp, err := http.Get(srv.URL + "/v1/runs/" + sr.GraphRunID)
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			leaks := bytes.Contains(raw, []byte(secret))
+			if leaks != tt.wantSecret {
+				t.Errorf("GET body secret-present = %v, want %v; body=%s", leaks, tt.wantSecret, raw)
+			}
+
+			// In all cases the interrupt must still be rendered (kind present), so the
+			// client learns the run errored even without the raw cause.
+			ivs, _ := got["interrupts"].([]any)
+			if len(ivs) == 0 {
+				t.Fatalf("expected interrupts rendered, got: %v", got)
+			}
+			iv, _ := ivs[0].(map[string]any)
+			if kind, _ := iv["kind"].(string); kind != "errored" {
+				t.Errorf("interrupt kind = %q, want errored", iv["kind"])
+			}
+		})
+	}
 }
 
 // assertErrorBody asserts the body is a small sanitized JSON {"error":"..."} that

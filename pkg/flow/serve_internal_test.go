@@ -176,12 +176,13 @@ func TestServeOneDuplicateRunAbsorbed(t *testing.T) {
 	}
 }
 
-// TestServeOneUnknownOpNacks proves a Work carrying an out-of-range WorkOp (only
+// TestServeOneUnknownOpAcks proves a Work carrying an out-of-range WorkOp (only
 // constructible by a corrupt/forged Work crossing the transport) is classified as
-// a transient failure → Nack, surfacing the corrupt Work by redelivery rather than
-// silently dropping it, and that execute returns the typed *UnknownWorkOpError
-// naming the offending op.
-func TestServeOneUnknownOpNacks(t *testing.T) {
+// a PERMANENT failure → Ack-and-abandon (§18.5): a corrupt op can NEVER succeed on
+// redelivery, so Nacking it would be an infinite redelivery loop (the H1 poison-
+// message DoS). execute still returns the typed *UnknownWorkOpError naming the op
+// for an operator log line; settle absorbs it with an Ack.
+func TestServeOneUnknownOpAcks(t *testing.T) {
 	t.Parallel()
 
 	h := newInternalIncHandle(t)
@@ -211,14 +212,67 @@ func TestServeOneUnknownOpNacks(t *testing.T) {
 		t.Errorf("Error() = %q, want it to name op %v", msg, corruptOp)
 	}
 
-	// serveOne routes it to a Nack (transient → redeliver), not a drop.
+	// serveOne routes a PERMANENT error to an Ack-and-abandon (not a Nack loop).
 	var tr ackTracker
 	serveOne(context.Background(), res, tr.delivery(w))
-	if got := tr.nacks.Load(); got != 1 {
-		t.Errorf("nacks = %d, want 1 (corrupt op → redeliver)", got)
+	if got := tr.acks.Load(); got != 1 {
+		t.Errorf("acks = %d, want 1 (permanent error → abandon, not redeliver)", got)
 	}
-	if got := tr.acks.Load(); got != 0 {
-		t.Errorf("acks = %d, want 0", got)
+	if got := tr.nacks.Load(); got != 0 {
+		t.Errorf("nacks = %d, want 0 (permanent error must not loop)", got)
+	}
+}
+
+// TestSettleClassification locks the §18.5 permanent-vs-transient classification
+// (the H1a poison-message fix): a PERMANENT error can never succeed on redelivery,
+// so it is Ack'd-and-abandoned (Nacking it is an infinite redelivery loop); only a
+// genuinely transient/infra error is Nack'd. nil and *GraphRunExistsError remain
+// Acks (quiescent / idempotent absorb).
+func TestSettleClassification(t *testing.T) {
+	t.Parallel()
+
+	id, err := NewGraphRunID()
+	if err != nil {
+		t.Fatalf("NewGraphRunID: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		err      error
+		wantAck  int64
+		wantNack int64
+	}{
+		// Quiescent / idempotent → Ack.
+		{name: "nil quiescent result acks", err: nil, wantAck: 1, wantNack: 0},
+		{name: "GraphRunExistsError idempotent acks", err: &GraphRunExistsError{GraphRunID: id}, wantAck: 1, wantNack: 0},
+
+		// Permanent (can never succeed on redelivery) → Ack-and-abandon.
+		{name: "ResumeTerminalError permanent acks", err: &ResumeTerminalError{Status: RunCompleted}, wantAck: 1, wantNack: 0},
+		{name: "GraphMismatchError permanent acks", err: &GraphMismatchError{}, wantAck: 1, wantNack: 0},
+		{name: "GraphVersionMismatchError permanent acks", err: &GraphVersionMismatchError{}, wantAck: 1, wantNack: 0},
+		{name: "GraphRunMismatchError permanent acks", err: &GraphRunMismatchError{}, wantAck: 1, wantNack: 0},
+		{name: "UnknownWorkOpError permanent acks", err: &UnknownWorkOpError{Op: WorkOp(99)}, wantAck: 1, wantNack: 0},
+		{name: "CheckpointDecodeError permanent acks", err: &CheckpointDecodeError{Field: "State", Err: errors.New("boom")}, wantAck: 1, wantNack: 0},
+
+		// Transient / infra (may succeed on redelivery) → Nack.
+		{name: "StoreError transient nacks", err: &StoreError{Op: "Append", Err: errors.New("down")}, wantAck: 0, wantNack: 1},
+		{name: "RevisionConflictError transient nacks", err: &RevisionConflictError{GraphRunID: id}, wantAck: 0, wantNack: 1},
+		{name: "unclassified transient nacks", err: errors.New("unclassified"), wantAck: 0, wantNack: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			w := Work{GraphRunID: id, Op: OpRun}
+			var tr ackTracker
+			settle(tr.delivery(w), tt.err)
+			if got := tr.acks.Load(); got != tt.wantAck {
+				t.Errorf("acks = %d, want %d", got, tt.wantAck)
+			}
+			if got := tr.nacks.Load(); got != tt.wantNack {
+				t.Errorf("nacks = %d, want %d", got, tt.wantNack)
+			}
+		})
 	}
 }
 
