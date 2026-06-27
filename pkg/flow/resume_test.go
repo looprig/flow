@@ -48,6 +48,16 @@ func flipTask(seen *atomic.Int32, gotPayload *atomic.Value, reason string) Task[
 
 // --- §10.4 validation (one per rule) ----------------------------------------
 
+// phaseDecodeErr reports whether err is the §10.4 phase/interrupt/halt-combination
+// validation failure: a *CheckpointDecodeError whose Field is "Phase". Every
+// invalid Phase combination wraps the unexported phaseComboError in exactly this
+// public shape, so callers errors.As the public type while the detail stays
+// inspectable.
+func phaseDecodeErr(err error) bool {
+	var e *CheckpointDecodeError
+	return errors.As(err, &e) && e.Field == "Phase"
+}
+
 // TestResumeValidationRejectsBeforeAnyTask proves each §10.4 rule fails fast with
 // its typed engine error, and that validation happens BEFORE any task runs: a
 // sentinel task records a side effect that must NOT fire on a validation failure.
@@ -150,7 +160,7 @@ func TestResumeValidationRejectsBeforeAnyTask(t *testing.T) {
 				cp.Interrupts = nil
 				cp.Halt = nil
 			},
-			wantErr: func(err error) bool { var e *CheckpointDecodeError; return errors.As(err, &e) },
+			wantErr: phaseDecodeErr,
 		},
 		{
 			name: "bad phase/halt combo: halted with interrupts",
@@ -159,7 +169,61 @@ func TestResumeValidationRejectsBeforeAnyTask(t *testing.T) {
 				cp.Halt = &HaltRecord{Kind: HaltMaxSteps}
 				cp.Interrupts = []InterruptRecord{{Vertex: vID(1), Kind: Errored}}
 			},
-			wantErr: func(err error) bool { var e *CheckpointDecodeError; return errors.As(err, &e) },
+			wantErr: phaseDecodeErr,
+		},
+		{
+			name: "bad phase/halt combo: halted without halt",
+			mutate: func(cp *Checkpoint, _ *Runner[cnt]) {
+				cp.Phase = StepHalted
+				cp.Halt = nil
+				cp.Interrupts = nil
+			},
+			wantErr: phaseDecodeErr,
+		},
+		{
+			name: "bad phase/halt combo: running carries a halt",
+			mutate: func(cp *Checkpoint, _ *Runner[cnt]) {
+				cp.Phase = StepRunning
+				cp.Halt = &HaltRecord{Kind: HaltDeadEnd}
+				cp.Interrupts = nil
+			},
+			wantErr: phaseDecodeErr,
+		},
+		{
+			name: "bad phase/halt combo: paused carries a halt",
+			mutate: func(cp *Checkpoint, _ *Runner[cnt]) {
+				cp.Phase = StepPaused
+				cp.Halt = &HaltRecord{Kind: HaltMaxSteps}
+				cp.Interrupts = []InterruptRecord{{Vertex: vID(1), Kind: Awaiting}}
+			},
+			wantErr: phaseDecodeErr,
+		},
+		{
+			name: "bad phase combo: routed carries interrupts",
+			mutate: func(cp *Checkpoint, _ *Runner[cnt]) {
+				cp.Phase = StepRouted
+				cp.Halt = nil
+				cp.Interrupts = []InterruptRecord{{Vertex: vID(1), Kind: Awaiting}}
+			},
+			wantErr: phaseDecodeErr,
+		},
+		{
+			name: "bad phase combo: routed carries a halt",
+			mutate: func(cp *Checkpoint, _ *Runner[cnt]) {
+				cp.Phase = StepRouted
+				cp.Halt = &HaltRecord{Kind: HaltDeadEnd}
+				cp.Interrupts = nil
+			},
+			wantErr: phaseDecodeErr,
+		},
+		{
+			name: "bad phase combo: unknown phase value",
+			mutate: func(cp *Checkpoint, _ *Runner[cnt]) {
+				cp.Phase = StepPhase(99) // not a declared phase
+				cp.Halt = nil
+				cp.Interrupts = nil
+			},
+			wantErr: phaseDecodeErr,
 		},
 	}
 	for _, tt := range tests {
@@ -1024,4 +1088,222 @@ func TestResumeCrashMidStepDoesNotReRunTerminal(t *testing.T) {
 func compileOver(t *testing.T, g *Graph[cnt], store CheckpointStore) (*Runner[cnt], error) {
 	t.Helper()
 	return g.Compile(vID(1), vID(4), WithStore(store))
+}
+
+// TestResumeGraphVersionMatrix is the §15 graph-versioning RESUME matrix
+// end-to-end: pause a run on graph G (the store records G's GraphVersion), then
+// resume against a LIVE graph that differs by exactly one dimension — a topology
+// edit (add a vertex+edge), a conditional Targets change, or a WithVersion bump —
+// and prove each yields a *GraphVersionMismatchError because the live
+// GraphVersion no longer matches the checkpoint's. An IDENTICAL rebuild of G
+// resumes fine. This complements TestResumeValidationRejectsBeforeAnyTask (which
+// mutates the checkpoint's GraphVersion field directly) by driving a REAL graph
+// edit through Compile's version computation, the way a deployment would.
+func TestResumeGraphVersionMatrix(t *testing.T) {
+	t.Parallel()
+
+	// pauseUntilResumed pauses Awaiting until a resume supplies a payload, then
+	// succeeds. Detecting resume via ResumePayload (not a counter) makes the task
+	// stateless across separate Runner instances built from the SAME graph
+	// definition — exactly how a redeploy recompiles a graph — so an identical
+	// rebuild completes on resume while only topology/Targets/version can differ.
+	pauseUntilResumed := func() Task[int, string] {
+		return NewFuncTask(func(ctx context.Context, _ int) (string, error) {
+			if _, ok := ResumePayload[string](ctx); !ok {
+				return "", Interrupt(ctx, "pause")
+			}
+			return "entry", nil
+		})
+	}
+
+	// buildBase wires entry(pauses until resumed) -> a -> fin over the SAME GraphID
+	// so the only thing that can differ between runs is topology/Targets/version.
+	buildBase := func(t *testing.T, store CheckpointStore, opts ...GraphOption) *Runner[cnt] {
+		t.Helper()
+		g := NewGraph[cnt](GraphID{}, opts...)
+		entry, a, fin := vID(1), vID(2), vID(3)
+		addErrVertex(t, g, entry, pauseUntilResumed())
+		tagVertex(t, g, a, "a")
+		tagVertex(t, g, fin, "fin")
+		for _, e := range [][2]VertexID{{entry, a}, {a, fin}} {
+			if err := g.AddEdge(e[0], e[1]); err != nil {
+				t.Fatalf("AddEdge: %v", err)
+			}
+		}
+		r, err := g.Compile(entry, fin, opts2compile(store)...)
+		if err != nil {
+			t.Fatalf("Compile base: %v", err)
+		}
+		return r
+	}
+
+	tests := []struct {
+		name string
+		// recompile builds the LIVE graph the resume runs against, over the SAME store.
+		recompile func(t *testing.T, store CheckpointStore) *Runner[cnt]
+		wantErr   bool // true → *GraphVersionMismatchError; false → identical, resumes fine
+	}{
+		{
+			name: "identical graph resumes fine",
+			recompile: func(t *testing.T, store CheckpointStore) *Runner[cnt] {
+				return buildBase(t, store)
+			},
+			wantErr: false,
+		},
+		{
+			name: "topology edit (extra vertex+edge) → mismatch",
+			recompile: func(t *testing.T, store CheckpointStore) *Runner[cnt] {
+				g := NewGraph[cnt](GraphID{})
+				entry, a, fin, extra := vID(1), vID(2), vID(3), vID(4)
+				addErrVertex(t, g, entry, pauseUntilResumed())
+				tagVertex(t, g, a, "a")
+				tagVertex(t, g, fin, "fin")
+				tagVertex(t, g, extra, "extra")
+				for _, e := range [][2]VertexID{{entry, a}, {a, extra}, {extra, fin}} {
+					if err := g.AddEdge(e[0], e[1]); err != nil {
+						t.Fatalf("AddEdge: %v", err)
+					}
+				}
+				r, err := g.Compile(entry, fin, WithStore(store))
+				if err != nil {
+					t.Fatalf("Compile edited: %v", err)
+				}
+				return r
+			},
+			wantErr: true,
+		},
+		{
+			name: "WithVersion bump → mismatch",
+			recompile: func(t *testing.T, store CheckpointStore) *Runner[cnt] {
+				return buildBase(t, store, WithVersion(42))
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewMemStore()
+			rBase := buildBase(t, store)
+			id := resumeOnce(t, rBase, store) // pause on the original graph version
+
+			live := tt.recompile(t, store)
+			res, err := live.Resume(context.Background(), id, "approve")
+			if tt.wantErr {
+				var mismatch *GraphVersionMismatchError
+				if !errors.As(err, &mismatch) {
+					t.Fatalf("Resume() error = %v, want *GraphVersionMismatchError", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Resume (identical graph) error = %v, want success", err)
+			}
+			if res.Run.Status != RunCompleted {
+				t.Errorf("Status = %v, want RunCompleted (identical graph resumes fine)", res.Run.Status)
+			}
+		})
+	}
+}
+
+// opts2compile returns the CompileOptions for a store-backed compile (a tiny
+// helper so the version-matrix fixtures don't repeat the nil-store branch).
+func opts2compile(store CheckpointStore) []CompileOption {
+	if store == nil {
+		return nil
+	}
+	return []CompileOption{WithStore(store)}
+}
+
+// TestRevisionModelInvariant locks the revision-model invariant (the controller's
+// recent off-by-one fix): a returned Result's Run.Revision is exactly the LATEST
+// persisted revision — res.Run.Revision == store.Latest(id).Run.Revision — for BOTH
+// a completed Run AND a Resume result. c.rs.Revision tracks the LAST WRITTEN
+// revision, so the Result and the store agree; an off-by-one (advancing before the
+// write, or after the snapshot) would silently regress this and is pinned here.
+func TestRevisionModelInvariant(t *testing.T) {
+	t.Parallel()
+
+	assertMatchesLatest := func(t *testing.T, store CheckpointStore, res *Result[cnt]) {
+		t.Helper()
+		latest, err := store.Latest(context.Background(), res.Run.GraphRunID)
+		if err != nil {
+			t.Fatalf("Latest: %v", err)
+		}
+		if res.Run.Revision != latest.Run.Revision {
+			t.Errorf("Result.Run.Revision = %d, want %d (== store.Latest revision)",
+				res.Run.Revision, latest.Run.Revision)
+		}
+		// The latest checkpoint count proves the revision is the highest written: a
+		// run with N checkpoints has revisions 0..N-1, so the latest revision == N-1.
+		hist, err := store.History(context.Background(), res.Run.GraphRunID)
+		if err != nil {
+			t.Fatalf("History: %v", err)
+		}
+		if want := uint64(len(hist) - 1); res.Run.Revision != want {
+			t.Errorf("Result.Run.Revision = %d, want %d (highest of %d contiguous revisions)",
+				res.Run.Revision, want, len(hist))
+		}
+	}
+
+	t.Run("completed Run result", func(t *testing.T) {
+		t.Parallel()
+		store := NewMemStore()
+		r, _ := compileChain(t, store, "a", "b", "fin")
+		res, err := r.Run(context.Background(), cnt{})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if res.Run.Status != RunCompleted {
+			t.Fatalf("Status = %v, want RunCompleted", res.Run.Status)
+		}
+		assertMatchesLatest(t, store, res)
+	})
+
+	t.Run("Resume result", func(t *testing.T) {
+		t.Parallel()
+		var firstSeen, secondSeen atomic.Int32
+		var gotPayload atomic.Value
+		store := NewMemStore()
+		g := NewGraph[cnt](GraphID{})
+		first, second := vID(1), vID(2)
+		addErrVertex(t, g, first, NewFuncTask(func(_ context.Context, _ int) (string, error) {
+			firstSeen.Add(1)
+			return "first", nil
+		}))
+		addErrVertex(t, g, second, flipTask(&secondSeen, &gotPayload, "approve"))
+		if err := g.AddEdge(first, second); err != nil {
+			t.Fatalf("AddEdge: %v", err)
+		}
+		r, err := g.Compile(first, second, WithStore(store))
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+
+		// The paused Run result also satisfies the invariant.
+		pausedRes, err := r.Run(context.Background(), cnt{})
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if pausedRes.Run.Status != RunInterrupted {
+			t.Fatalf("paused Status = %v, want RunInterrupted", pausedRes.Run.Status)
+		}
+		assertMatchesLatest(t, store, pausedRes)
+
+		// And so does the completed Resume result, after more revisions are appended.
+		res, err := r.Resume(context.Background(), pausedRes.Run.GraphRunID, "the-payload")
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		if res.Run.Status != RunCompleted {
+			t.Fatalf("Resume Status = %v, want RunCompleted", res.Run.Status)
+		}
+		if res.Run.Revision <= pausedRes.Run.Revision {
+			t.Errorf("Resume Revision %d <= paused Revision %d (resume must advance the sequence)",
+				res.Run.Revision, pausedRes.Run.Revision)
+		}
+		assertMatchesLatest(t, store, res)
+	})
 }

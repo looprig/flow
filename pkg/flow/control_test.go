@@ -603,3 +603,218 @@ func TestControlGenuineConflictPropagates(t *testing.T) {
 		t.Fatalf("Run() error = %v, want *RevisionConflictError (genuine conflict)", err)
 	}
 }
+
+// conflictThenLatestFailStore is conflictStore PLUS a failing Latest: after the
+// injected revision-conflict it makes Latest return a *StoreError, exercising
+// classifyAppendErr's Latest-read-failure branch (engine.go). The coordinator
+// cannot prove the conflict was a cancellation (it can't read the latest), so it
+// must FAIL SECURE — propagate the conflict error rather than treat it as an
+// observed cancellation and silently complete.
+type conflictThenLatestFailStore struct {
+	CheckpointStore
+	atRevision uint64
+	injectOnce sync.Once
+	injected   atomic.Bool
+	latestErr  error // returned by Latest once the conflict has been injected
+}
+
+func (s *conflictThenLatestFailStore) Append(ctx context.Context, cp *Checkpoint) error {
+	if cp.Run.Revision == s.atRevision && !s.injected.Load() {
+		s.injectOnce.Do(func() {
+			rival := *cp
+			rival.Run.Status = RunRunning // a rival running writer, NOT a cancel
+			_ = s.CheckpointStore.Append(ctx, &rival)
+			s.injected.Store(true)
+		})
+	}
+	return s.CheckpointStore.Append(ctx, cp)
+}
+
+func (s *conflictThenLatestFailStore) Latest(ctx context.Context, id GraphRunID) (*Checkpoint, error) {
+	if s.injected.Load() {
+		return nil, s.latestErr // the classify-time read cannot prove a cancellation
+	}
+	return s.CheckpointStore.Latest(ctx, id)
+}
+
+// TestControlClassifyAppendErrLatestFailureFailsSecure pins the Latest-read-failure
+// branch of classifyAppendErr (gap from the 6.11 review): a racy append loses with
+// a *RevisionConflictError AND the subsequent Latest read fails, so the coordinator
+// cannot distinguish an observed cancellation from a genuine conflict. Fail secure:
+// it propagates a REAL error (never a graceful nil Result), and specifically NOT an
+// observed-cancellation completion. We assert the original conflict propagates.
+func TestControlClassifyAppendErrLatestFailureFailsSecure(t *testing.T) {
+	t.Parallel()
+
+	store := &conflictThenLatestFailStore{
+		CheckpointStore: NewMemStore(),
+		atRevision:      1, // seed = rev 0; the coordinator's next append = rev 1
+		latestErr:       &StoreError{Op: "Latest", Err: errors.New("store unavailable")},
+	}
+	r, _ := compileChain(t, store, "a", "fin")
+
+	res, err := r.Run(context.Background(), cnt{})
+	if err == nil {
+		t.Fatalf("Run() returned nil error (res=%+v); want the conflict propagated (fail secure)", res)
+	}
+	// The original conflict is returned UNCHANGED — not swallowed as a cancellation.
+	if !errors.As(err, new(*RevisionConflictError)) {
+		t.Fatalf("Run() error = %v, want the original *RevisionConflictError (Latest read failed → fail secure)", err)
+	}
+	// A run whose Latest read failed must NOT be reported as gracefully Cancelled.
+	if res != nil && res.Run.Status == RunCancelled {
+		t.Error("classifyAppendErr treated a Latest-read-failure as observed cancellation; want fail-secure error")
+	}
+}
+
+// appendFailStore wraps a CheckpointStore and makes the FIRST Append fail with a
+// chosen error (delegating all other ops), so a single control-plane Append (e.g.
+// Cancel's terminal write) can be made to fail without execution. Unlike
+// crashAfterStore (counts appends) this fails the next append outright, which is
+// what Cancel issues exactly once.
+type appendFailStore struct {
+	CheckpointStore
+	failErr  error
+	failOnce sync.Once
+	failed   atomic.Bool
+}
+
+func (s *appendFailStore) Append(ctx context.Context, cp *Checkpoint) error {
+	var inject error
+	s.failOnce.Do(func() { inject = s.failErr; s.failed.Store(true) })
+	if inject != nil {
+		return inject
+	}
+	return s.CheckpointStore.Append(ctx, cp)
+}
+
+// TestControlCancelAppendErrorPropagates pins Cancel's store-append-error path (gap
+// from the 6.11 review): when the terminal RunCancelled append fails with a
+// non-terminal error, Cancel returns that error UNCHANGED and OnRunFinish does NOT
+// fire (no observer is told the run was cancelled when the cancel did not persist).
+func TestControlCancelAppendErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		failErr error
+		assert  func(t *testing.T, err error)
+	}{
+		{
+			name:    "revision conflict on cancel append",
+			failErr: &RevisionConflictError{Expected: 9, Actual: 1},
+			assert: func(t *testing.T, err error) {
+				if !errors.As(err, new(*RevisionConflictError)) {
+					t.Fatalf("Cancel() error = %v, want *RevisionConflictError unchanged", err)
+				}
+			},
+		},
+		{
+			name:    "store error on cancel append",
+			failErr: &StoreError{Op: "Append", Err: errors.New("disk full")},
+			assert: func(t *testing.T, err error) {
+				if !errors.As(err, new(*StoreError)) {
+					t.Fatalf("Cancel() error = %v, want *StoreError unchanged", err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Seed a non-terminal run via a real run so Latest reads a cancellable
+			// checkpoint; THEN wrap the same backing store so only the cancel append
+			// fails (the prior run's appends already succeeded on the inner store).
+			mem := NewMemStore()
+			g := NewGraph[cnt](GraphID{})
+			entry := vID(1)
+			addErrVertex(t, g, entry, interruptTask("pause"))
+			rSeed, err := g.Compile(entry, entry, WithStore(mem))
+			if err != nil {
+				t.Fatalf("Compile(seed): %v", err)
+			}
+			ctx := context.Background()
+			res, err := rSeed.Run(ctx, cnt{})
+			if err != nil {
+				t.Fatalf("Run(seed): %v", err)
+			}
+			id := res.Run.GraphRunID
+
+			fail := &appendFailStore{CheckpointStore: mem, failErr: tt.failErr}
+			rCancel, err := g.Compile(entry, entry, WithStore(fail))
+			if err != nil {
+				t.Fatalf("Compile(cancel): %v", err)
+			}
+
+			rc := &recorder{}
+			cancelErr := rCancel.Cancel(ctx, id, "reason", WithHooks(rc.hooks()))
+			tt.assert(t, cancelErr)
+
+			// OnRunFinish must NOT fire when the terminal append failed.
+			rc.mu.Lock()
+			finishes := rc.runFinish
+			rc.mu.Unlock()
+			if finishes != 0 {
+				t.Errorf("OnRunFinish fired %d times after a failed cancel append, want 0", finishes)
+			}
+			// The run is still cancellable (status unchanged) — the cancel did not persist.
+			rs, err := rSeed.Status(ctx, id)
+			if err != nil {
+				t.Fatalf("Status: %v", err)
+			}
+			if rs.Status == RunCancelled {
+				t.Error("Status = RunCancelled after a FAILED cancel append, want the prior non-terminal status")
+			}
+		})
+	}
+}
+
+// TestControlGetHaltNilRecordNoPanic pins reconstructHalt's nil-record branch (gap
+// from the 6.11 review): a hand-built StepHalted checkpoint with a NIL HaltRecord (a
+// corrupt store) makes Get return a Result with Halt == nil — no panic, no Interrupts.
+func TestControlGetHaltNilRecordNoPanic(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	r, _ := compileSingle(t, store)
+	ctx := context.Background()
+
+	id, err := NewGraphRunID()
+	if err != nil {
+		t.Fatalf("NewGraphRunID: %v", err)
+	}
+	// A StepHalted checkpoint whose Halt record is nil (corrupt) — State is a valid
+	// cnt so the decode succeeds and execution reaches reconstructHalt(id, nil).
+	cp := &Checkpoint{
+		Run: GraphRunState{
+			GraphRunID:   id,
+			GraphID:      r.GraphID(),
+			GraphVersion: r.GraphVersion(),
+			Status:       RunInterrupted, // a halted run carries RunInterrupted (§9.8)
+			Step:         StepID(2),
+		},
+		State: json.RawMessage(`{"Vals":["x"],"N":1}`),
+		Phase: StepHalted,
+		Halt:  nil, // the corrupt-store case
+	}
+	if err := store.Append(ctx, cp); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	got, err := r.Get(ctx, id) // must not panic
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Halt != nil {
+		t.Errorf("Get.Halt = %+v, want nil (nil HaltRecord → nil Halt)", got.Halt)
+	}
+	if got.Interrupts != nil {
+		t.Errorf("Get.Interrupts = %v, want nil (StepHalted reconstructs Halt, not Interrupts)", got.Interrupts)
+	}
+	// State still decodes so the Result is otherwise usable.
+	if len(got.State.Vals) != 1 || got.State.Vals[0] != "x" {
+		t.Errorf("Get.State.Vals = %v, want [x]", got.State.Vals)
+	}
+}
