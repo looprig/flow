@@ -61,6 +61,73 @@ func decodeState(t *testing.T, raw json.RawMessage) cnt {
 	return s
 }
 
+// TestRunSameTaskBoundIntoTwoGraphs pins the §15 binding row: ONE shared Task
+// value bound into TWO independently-compiled graphs runs unchanged in each — a
+// Task is a stateless, reusable value (§5/§6), so the two runs are isolated and
+// both produce the correct reduced output. This complements TestFuncTaskReusable
+// (one task, many Execute calls) by exercising the full Run path twice over the
+// SAME task value with separate stores and states.
+func TestRunSameTaskBoundIntoTwoGraphs(t *testing.T) {
+	t.Parallel()
+
+	// One shared, stateless task value bound into both graphs.
+	shared := NewFuncTask(func(_ context.Context, in int) (string, error) {
+		return "tag=" + itoa(in), nil
+	})
+	sel := func(s cnt) int { return s.N }
+	red := func(s *cnt, out string) error {
+		s.Vals = append(s.Vals, out)
+		s.N++
+		return nil
+	}
+
+	build := func(t *testing.T) (*Runner[cnt], *MemStore) {
+		t.Helper()
+		store := NewMemStore()
+		g := NewGraph[cnt](GraphID{})
+		entry := vID(1)
+		if err := AddVertex(g, entry, shared, sel, red); err != nil {
+			t.Fatalf("AddVertex: %v", err)
+		}
+		r, err := g.Compile(entry, entry, WithStore(store))
+		if err != nil {
+			t.Fatalf("Compile: %v", err)
+		}
+		return r, store
+	}
+
+	r1, store1 := build(t)
+	r2, _ := build(t)
+	ctx := context.Background()
+
+	res1, err := r1.Run(ctx, cnt{N: 1})
+	if err != nil {
+		t.Fatalf("Run g1: %v", err)
+	}
+	res2, err := r2.Run(ctx, cnt{N: 2})
+	if err != nil {
+		t.Fatalf("Run g2: %v", err)
+	}
+
+	if res1.Run.Status != RunCompleted || res2.Run.Status != RunCompleted {
+		t.Fatalf("statuses = %v, %v, want both RunCompleted", res1.Run.Status, res2.Run.Status)
+	}
+	// Each run folds the SAME task against its OWN starting state — no cross-talk.
+	if len(res1.State.Vals) != 1 || res1.State.Vals[0] != "tag=1" {
+		t.Errorf("g1 State.Vals = %v, want [tag=1]", res1.State.Vals)
+	}
+	if len(res2.State.Vals) != 1 || res2.State.Vals[0] != "tag=2" {
+		t.Errorf("g2 State.Vals = %v, want [tag=2]", res2.State.Vals)
+	}
+	// The two runs live in separate stores with distinct ids (full isolation).
+	if res1.Run.GraphRunID == res2.Run.GraphRunID {
+		t.Error("the two runs shared a GraphRunID, want distinct")
+	}
+	if _, err := store1.Latest(ctx, res2.Run.GraphRunID); !errors.As(err, new(*CheckpointNotFoundError)) {
+		t.Error("g1's store knows g2's run — stores are not isolated")
+	}
+}
+
 // TestRunSingleVertex covers entry == finish: the one vertex runs once, Result
 // carries its reduced output and RunCompleted, and the history holds a seed
 // checkpoint (rev 0, StepRouted, Frontier == [entry]) plus a final checkpoint
@@ -2413,6 +2480,106 @@ func TestRunSuccessReducerErrorPauses(t *testing.T) {
 	}
 }
 
+// TestRunUserCallbackPanicSafety pins §12.5 / §15 panic-safety at the ENGINE level
+// (not just the dispatcher): a panic in the SELECTOR (input derivation) or in the
+// SUCCESS-PATH reducer is recovered to a *VertexError and follows the default
+// error policy (pause Errored) — the coordinator never crashes, no engine error is
+// returned, and a reducer panic leaves S byte-for-byte unchanged (clone discarded).
+// task / Pick / record-reducer / retry-callback panics are covered elsewhere
+// (TestRunWithRetryTaskPanic*, TestRunConditionalPickPanicHalt,
+// TestRunRecordReducerFailurePauses, TestRunWithRetry*PanicStops); this fills the
+// selector and success-reducer rows. The selector row is also the regression test
+// for the prepareRuns crash: an unrecovered selector panic crashed the run.
+func TestRunUserCallbackPanicSafety(t *testing.T) {
+	t.Parallel()
+
+	const seedN = 7 // a non-zero base the selector/reducer can prove is preserved
+
+	tests := []struct {
+		name string
+		// build adds a single entry vertex whose selector or reducer panics.
+		build func(t *testing.T, g *Graph[cnt], entry VertexID)
+	}{
+		{
+			name: "selector panic",
+			build: func(t *testing.T, g *Graph[cnt], entry VertexID) {
+				task := NewFuncTask(func(_ context.Context, _ int) (string, error) { return "ok", nil })
+				sel := func(_ cnt) int { panic("selector boom") }
+				red := func(s *cnt, out string) error { s.Vals = append(s.Vals, out); return nil }
+				if err := AddVertex(g, entry, task, sel, red); err != nil {
+					t.Fatalf("AddVertex: %v", err)
+				}
+			},
+		},
+		{
+			name: "success-path reducer panic",
+			build: func(t *testing.T, g *Graph[cnt], entry VertexID) {
+				task := NewFuncTask(func(_ context.Context, _ int) (string, error) { return "ok", nil })
+				sel := func(s cnt) int { return s.N }
+				// Mutate the passed-in clone THEN panic: the commit must be discarded.
+				red := func(s *cnt, _ string) error {
+					s.Vals = append(s.Vals, "mutated-before-panic")
+					s.N = 999
+					panic("reducer boom")
+				}
+				if err := AddVertex(g, entry, task, sel, red); err != nil {
+					t.Fatalf("AddVertex: %v", err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewMemStore()
+			g := NewGraph[cnt](GraphID{})
+			entry := vID(1)
+			tt.build(t, g, entry)
+			r, err := g.Compile(entry, entry, WithStore(store))
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+
+			er := &errRecorder{}
+			res, err := r.Run(context.Background(), cnt{N: seedN}, WithHooks(er.hooks()))
+			// A recovered user panic is NOT an engine error — it follows the policy.
+			if err != nil {
+				t.Fatalf("Run returned engine error %v, want nil (panic recovered to error policy)", err)
+			}
+			if res.Run.Status != RunInterrupted {
+				t.Fatalf("Status = %v, want RunInterrupted (recovered panic pauses Errored)", res.Run.Status)
+			}
+			if len(res.Interrupts) != 1 || res.Interrupts[0].Kind != Errored {
+				t.Fatalf("Interrupts = %+v, want exactly one Errored pause", res.Interrupts)
+			}
+			if res.Interrupts[0].Vertex != entry {
+				t.Errorf("paused vertex = %v, want %v", res.Interrupts[0].Vertex, entry)
+			}
+			// The Errored cause is the recovered *VertexError mentioning "panic".
+			cause := res.Interrupts[0].Cause
+			if cause == nil {
+				t.Fatal("Errored Interruption has nil Cause, want the recovered VertexError")
+			}
+			if !strings.Contains(cause.Error(), "panic") {
+				t.Errorf("Cause = %q, want a cause mentioning %q", cause.Error(), "panic")
+			}
+			// S is byte-for-byte the seed: a selector panic never reduced, and a
+			// reducer panic's clone is discarded (mutate-then-panic does not leak).
+			if len(res.State.Vals) != 0 || res.State.N != seedN {
+				t.Errorf("State = %+v, want {Vals:[] N:%d} unchanged (clone discarded)", res.State, seedN)
+			}
+			er.mu.Lock()
+			got := er.interrupts
+			er.mu.Unlock()
+			if got != 1 {
+				t.Errorf("OnInterrupt fired %d times, want 1", got)
+			}
+		})
+	}
+}
+
 // --- Task 6.7: interrupt hardening (§9.7) -----------------------------------
 
 // fanOutTwo wires entry -> {a, b} -> finish over cnt and compiles it, returning
@@ -2980,5 +3147,116 @@ func TestRunPerStepPauseStillCheckpointed(t *testing.T) {
 	var info string
 	if err := json.Unmarshal(last.Interrupts[0].Info, &info); err != nil || info != "need human approval" {
 		t.Errorf("InterruptRecord.Info = %s (err %v), want marshaled reason", last.Interrupts[0].Info, err)
+	}
+}
+
+// TestRunStateMarshalFailureReturnsCodecError pins the engine's fail-secure
+// marshal branch (§12.3): a graph state S that cannot be JSON-marshaled makes the
+// seed checkpoint's marshal fail, so Run returns a *codecError{Op:"marshal"} engine
+// error — never a partial checkpoint, never a status. chanState (clone_test.go)
+// holds a channel, which encoding/json refuses to marshal. This exercises the
+// shared coordinator.checkpoint marshal-failure branch every boundary append guards.
+func TestRunStateMarshalFailureReturnsCodecError(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	g := NewGraph[chanState](GraphID{})
+	entry := vID(1)
+	// A trivial vertex; the run never gets past the seed checkpoint's marshal.
+	if err := AddVertex[int, int, chanState](g, entry,
+		NewFuncTask(func(_ context.Context, _ int) (int, error) { return 0, nil }),
+		func(_ chanState) int { return 0 },
+		func(_ *chanState, _ int) error { return nil },
+	); err != nil {
+		t.Fatalf("AddVertex: %v", err)
+	}
+	r, err := g.Compile(entry, entry, WithStore(store))
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	res, err := r.Run(context.Background(), chanState{C: make(chan int)})
+	var ce *codecError
+	if !errors.As(err, &ce) {
+		t.Fatalf("Run() error = %v, want *codecError (unmarshalable state fails secure)", err)
+	}
+	if ce.Op != "marshal" {
+		t.Errorf("codecError.Op = %q, want %q", ce.Op, "marshal")
+	}
+	if res != nil {
+		t.Errorf("Run returned a non-nil Result %+v on a marshal failure, want nil", res)
+	}
+}
+
+// TestRunStoreAppendFailureReturnsError pins §15 "store Append failure → error
+// return (not a status)": a coordinator whose durable Append fails at a given
+// boundary surfaces the failure as an ENGINE error from Run, NOT as a run status.
+// crashAfterStore (resume_test.go) fails the Nth append; we drive the seed append
+// (rev 0), the completion boundary, and the halt boundary, asserting each Run
+// returns the sentinel rather than a (Result, nil). This is the fail-secure §12.3
+// contract: an unwritable checkpoint aborts the run rather than reporting progress
+// that was never persisted.
+func TestRunStoreAppendFailureReturnsError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		failOn int // 1-based append to fail
+		build  func(t *testing.T, store CheckpointStore) (*Runner[cnt], []RunOption)
+	}{
+		{
+			name:   "seed append fails (rev 0)",
+			failOn: 1, // the very first append is the StepRouted seed
+			build: func(t *testing.T, store CheckpointStore) (*Runner[cnt], []RunOption) {
+				r, _ := compileChain(t, store, "a", "fin")
+				return r, nil
+			},
+		},
+		{
+			name:   "completion boundary append fails",
+			failOn: 2, // PerStep: append 1 = seed, append 2 = the completing boundary
+			build: func(t *testing.T, store CheckpointStore) (*Runner[cnt], []RunOption) {
+				r, _ := compileChain(t, store, "fin") // entry == finish: one boundary
+				return r, []RunOption{WithCheckpointEvery(PerStep)}
+			},
+		},
+		{
+			name:   "halt boundary append fails",
+			failOn: 2, // append 1 = seed (rev 0); WithMaxSteps(0) halts at step 0 → append 2
+			build: func(t *testing.T, store CheckpointStore) (*Runner[cnt], []RunOption) {
+				// A self-cycle that would loop forever; WithMaxSteps(0) makes the loop
+				// halt HaltMaxSteps at step 0 (right after seed), so the StepHalted
+				// boundary is the SECOND append — the one crashAfterStore fails.
+				g := NewGraph[cnt](GraphID{})
+				entry := vID(1)
+				tagVertex(t, g, entry, "entry")
+				if err := g.AddEdge(entry, entry); err != nil {
+					t.Fatalf("AddEdge(self): %v", err)
+				}
+				r, err := g.Compile(entry, entry, WithStore(store))
+				if err != nil {
+					t.Fatalf("Compile: %v", err)
+				}
+				return r, []RunOption{WithMaxSteps(0)}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			crash := &crashAfterStore{inner: NewMemStore(), failOn: tt.failOn}
+			r, opts := tt.build(t, crash)
+			res, err := r.Run(context.Background(), cnt{}, opts...)
+			if !errors.Is(err, errSimulatedCrash) {
+				t.Fatalf("Run() error = %v, want the simulated store-append crash (engine error, fail secure)", err)
+			}
+			// The failure is an ERROR, never a (Result with a status). A non-nil Result
+			// must not report progress that the unwritable checkpoint never persisted.
+			if res != nil && res.Run.Status == RunCompleted {
+				t.Error("Run returned RunCompleted despite a failed boundary append; want an error and no completion")
+			}
+		})
 	}
 }

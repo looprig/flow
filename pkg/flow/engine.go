@@ -256,8 +256,11 @@ func (c *coordinator[S]) runStep(ctx context.Context) ([]*vertexRun[S], error) {
 
 // prepareRuns builds one vertexRun per frontier vertex (sorted by VertexID for
 // deterministic ordering): it looks up the bound vertex, derives its input from
-// the frozen step base via the selector, and mints a Running VertexState stamped
-// CreatedAt. It is the §9.2.2 freeze-and-inputs phase.
+// the frozen step base via the selector (under panic recovery, §12.5), and mints a
+// Running VertexState stamped CreatedAt. It is the §9.2.2 freeze-and-inputs phase.
+// A selector that PANICS cannot produce input: the panic is recovered to a
+// *VertexError pre-set on r.err, so execVertex skips the task and the vertex
+// follows its error policy (Route/Pause) instead of crashing the coordinator.
 func (c *coordinator[S]) prepareRuns(stepBase S) ([]*vertexRun[S], error) {
 	ordered := sortFrontier(c.frontier)
 	runs := make([]*vertexRun[S], 0, len(ordered))
@@ -267,9 +270,8 @@ func (c *coordinator[S]) prepareRuns(stepBase S) ([]*vertexRun[S], error) {
 		if err != nil {
 			return nil, err
 		}
-		runs = append(runs, &vertexRun[S]{
-			v:  v,
-			in: v.selectInput(stepBase),
+		r := &vertexRun[S]{
+			v: v,
 			vs: VertexState{
 				VertexID:    id,
 				VertexRunID: vrid,
@@ -277,9 +279,31 @@ func (c *coordinator[S]) prepareRuns(stepBase S) ([]*vertexRun[S], error) {
 				Status:      VertexRunning,
 				CreatedAt:   time.Now(),
 			},
+		}
+		r.in, r.err = deriveInput(v, stepBase, RunInfo{
+			GraphID:     c.rs.GraphID,
+			GraphRunID:  c.rs.GraphRunID,
+			VertexID:    id,
+			VertexRunID: vrid,
+			Step:        c.rs.Step,
 		})
+		runs = append(runs, r)
 	}
 	return runs, nil
+}
+
+// deriveInput runs the vertex's selector under panic recovery (§12.5). On success
+// it returns the boxed input and a nil error; a selector panic is recovered to a
+// *VertexError (attempt 1 — input derivation precedes any retry loop) so the
+// vertex cannot produce input and follows its error policy. The recovered panic
+// never escapes into the coordinator goroutine.
+func deriveInput[S any](v *vertex[S], stepBase S, rinfo RunInfo) (in any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			in, err = nil, vertexErr(rinfo, 1, fmt.Errorf("panic: %v", r))
+		}
+	}()
+	return v.selectInput(stepBase), nil
 }
 
 // execVertex runs one vertex's task under its retry policy and per-vertex timeout
@@ -291,6 +315,12 @@ func (c *coordinator[S]) prepareRuns(stepBase S) ([]*vertexRun[S], error) {
 // yields a *VertexError wrapping context.DeadlineExceeded via runWithRetry,
 // retryable by default. The classify-and-reduce phase drives the outcome off err.
 func (c *coordinator[S]) execVertex(ctx context.Context, r *vertexRun[S]) {
+	// A selector panic recovered in prepareRuns already set r.err to a *VertexError:
+	// the vertex cannot produce input, so the task never runs and the recorded
+	// failure flows straight into the error policy (§12.5).
+	if r.err != nil {
+		return
+	}
 	rinfo := RunInfo{
 		GraphID:     c.rs.GraphID,
 		GraphRunID:  c.rs.GraphRunID,
