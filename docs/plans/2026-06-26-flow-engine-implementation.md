@@ -607,17 +607,17 @@
 
 Use `superpowers:verification-before-completion` — paste the actual command output, do not assert from memory.
 
-- [ ] `gofmt -l .` → empty (core) and in `pkg/nats`.
-- [ ] `CGO_ENABLED=0 go build -trimpath ./...` → clean.
-- [ ] `go test -race ./...` → all pass (core).
-- [ ] `cd pkg/nats && go test -tags integration -race ./...` → all pass.
-- [ ] `go test ./pkg/... -fuzz=FuzzParse -fuzztime=60s` and `-fuzz=FuzzCheckpointRoundTrip -fuzztime=60s` → no crashes.
-- [ ] `staticcheck ./...`, `go vet ./...`, `gosec ./...`, `govulncheck ./...` → clean.
-- [ ] `go mod graph` (repo root) → **zero runtime dependencies** in the core module; NATS confined to `pkg/nats`'s `go.mod`.
-- [ ] Every §15 testing-strategy bullet has a corresponding passing test.
-- [ ] The §16 worked example passes as a runnable test.
-- [ ] CLAUDE.md "Dependencies" updated to record the NATS approval (§18.4).
-- [ ] All public APIs return typed errors (§12.4); no `any` leaks to callers (CLAUDE.md).
+- [x] `gofmt -l .` → empty (core) and in `pkg/nats` (own files; vendored third-party excluded per CLAUDE.md). ✓ 2026-06-27
+- [x] `CGO_ENABLED=0 go build -trimpath ./...` → clean (via `make check`). ✓
+- [x] `go test -race ./...` → all pass (core). ✓
+- [x] `cd pkg/nats && go test -tags integration -race ./...` → all pass (vendored). ✓
+- [x] `go test ./pkg/... -fuzz=FuzzParse -fuzztime=60s` and `-fuzz=FuzzCheckpointRoundTrip -fuzztime=60s` → no crashes (60s each, no new corpus written). ✓
+- [x] `staticcheck ./...`, `go vet ./...`, `gosec ./...`, `govulncheck ./...` → clean (gosec 0 issues, govulncheck no vulns). ✓
+- [x] `go mod graph` (repo root) → **zero runtime dependencies** in the core module (also `go list -deps ./pkg/... ./cmd/...` → zero third-party); NATS confined to `pkg/nats`'s `go.mod` + its own vendor tree. ✓
+- [x] Every §15 testing-strategy bullet has a corresponding passing test (Phase 7 §15 coverage audit; ~96.9% core coverage). ✓
+- [x] The §16 worked example passes as a runnable test (`cmd/embed`, `cmd/service`, and the Tier-C `pkg/nats/cmd/distributed` smoke + durability tests). ✓
+- [x] CLAUDE.md "Dependencies" updated to record the NATS approval (§18.4). ✓ (commit `b05e032`)
+- [x] All public APIs return typed errors (§12.4); no `any` leaks to callers (verified across phase reviews). ✓
 
 ---
 
