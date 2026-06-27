@@ -199,6 +199,68 @@ func TestRegistryManifest(t *testing.T) {
 	}
 }
 
+// TestRegistryKeys proves Keys flattens every registered (GraphID,GraphVersion)
+// into one GraphVersionKey per registration, in deterministic order, so a worker
+// can Consume exactly the keys it serves (§18.5/§18.6). An empty registry yields
+// an empty (non-nil) slice.
+func TestRegistryKeys(t *testing.T) {
+	t.Parallel()
+
+	idA := gID(1)
+	idB := gID(2)
+	a1 := newHandle(t, idA, 1)
+	a2 := newHandle(t, idA, 2)
+	b1 := newHandle(t, idB, 1)
+
+	reg := registry.New()
+	for _, h := range []flow.RunnerHandle{a2, b1, a1} { // add out of order
+		if err := reg.Add(h); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+
+	want := []flow.GraphVersionKey{
+		{GraphID: idA, GraphVersion: a1.GraphVersion()},
+		{GraphID: idA, GraphVersion: a2.GraphVersion()},
+		{GraphID: idB, GraphVersion: b1.GraphVersion()},
+	}
+	sort.Slice(want, func(i, j int) bool { return keyLess(want[i], want[j]) })
+
+	got := reg.Keys()
+	if len(got) != len(want) {
+		t.Fatalf("Keys len = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Keys[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	// Determinism: two calls return the same order.
+	again := reg.Keys()
+	for i := range got {
+		if got[i] != again[i] {
+			t.Errorf("Keys not deterministic at %d: %+v vs %+v", i, got[i], again[i])
+		}
+	}
+
+	// Empty registry: a non-nil empty slice (a worker that serves nothing).
+	if empty := registry.New().Keys(); empty == nil {
+		t.Error("Keys() on empty registry = nil, want non-nil empty slice")
+	} else if len(empty) != 0 {
+		t.Errorf("Keys() on empty registry len = %d, want 0", len(empty))
+	}
+}
+
+// keyLess orders GraphVersionKeys for the deterministic-order assertion: by
+// GraphID bytes, then GraphVersion.
+func keyLess(a, b flow.GraphVersionKey) bool {
+	if a.GraphID != b.GraphID {
+		return a.GraphID.String() < b.GraphID.String()
+	}
+	return a.GraphVersion < b.GraphVersion
+}
+
 // TestRegistryConcurrentAddResolve exercises Add and Resolve concurrently so the
 // RWMutex is proven race-clean under -race. Each goroutine registers a distinct
 // (id,version) then resolves it back.

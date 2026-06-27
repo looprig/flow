@@ -97,6 +97,30 @@ func (r *Registry) Manifest() []GraphManifest {
 	return out
 }
 
+// Keys returns one flow.GraphVersionKey per registered (GraphID, GraphVersion),
+// in deterministic order (sorted by GraphID bytes then version), so flow.Serve can
+// Consume EXACTLY the keys this registry serves (§18.5/§18.6 — registration is
+// implicit via Consume). It is concurrency-safe (read lock) and returns a freshly
+// allocated, non-nil slice (empty when nothing is registered) so a caller cannot
+// mutate the registry's internal state. With Resolve, this satisfies flow.Resolver
+// structurally — no adapter needed.
+func (r *Registry) Keys() []flow.GraphVersionKey {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	keys := make([]flow.GraphVersionKey, 0, len(r.handles))
+	for k := range r.handles {
+		keys = append(keys, flow.GraphVersionKey{GraphID: k.id, GraphVersion: k.version})
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].GraphID != keys[j].GraphID {
+			return keys[i].GraphID.String() < keys[j].GraphID.String()
+		}
+		return keys[i].GraphVersion < keys[j].GraphVersion
+	})
+	return keys
+}
+
 // DuplicateRegistrationError reports an Add of a (GraphID, Version) that is
 // already registered (§18.1). Per CLAUDE.md every package-level failure is a
 // concrete typed error so callers can errors.As to inspect it; it names both the
