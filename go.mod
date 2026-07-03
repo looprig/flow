@@ -1,4 +1,4 @@
-module github.com/ciram-co/flow
+module github.com/looprig/flow
 
 go 1.25.0
 

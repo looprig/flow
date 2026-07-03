@@ -25,7 +25,7 @@
 - **Workspace & vendoring:** A parent `go.work` at `/Users/ipotter/code/go.work` does not list `./flows`, so **all `go`/`gofmt` commands in this repo must run with `GOWORK=off`** (flows is a standalone module). The repo is also **vendored** (looprig pattern, Task 0.2): the `Makefile` exports `GOWORK := off` and `GOFLAGS := -mod=vendor`, so prefer the `make` targets. For ad-hoc/targeted commands, prefix with `GOWORK=off GOFLAGS=-mod=vendor` (e.g. running one test).
 - **Standard verification** (before every commit): run **`make check`** (= `fmt-check` + `vet` + `staticcheck` + `gosec` + `go mod verify` + `govulncheck` + `build` + `race-test`). For a targeted test loop: `GOWORK=off GOFLAGS=-mod=vendor go test -race ./pkg/<pkg>/ -run TestName -v`. Milestones that add fuzz/integration name the extra command explicitly.
 - **Required skills while executing:** `superpowers:test-driven-development` (every task), `superpowers:systematic-debugging` (any failure), `superpowers:requesting-code-review` (end of each phase), `superpowers:verification-before-completion` (before any "done" claim).
-- **Module path:** `github.com/ciram-co/flow`; engine package import path `github.com/ciram-co/flow/pkg/flow` (§1). All paths below are relative to repo root `/Users/ipotter/code/flows`.
+- **Module path:** `github.com/looprig/flow`; engine package import path `github.com/looprig/flow/pkg/flow` (§1). All paths below are relative to repo root `/Users/ipotter/code/flows`.
 
 ---
 
@@ -40,11 +40,11 @@
 
 **Files:**
 - Create: `go.mod`, `.gitignore`
-- Create (empty package dirs with a `doc.go` each): `pkg/uuid/`, `pkg/flow/`, `pkg/controlplane/`, `pkg/registry/`, `pkg/ingress/` (all service packages live **under `pkg/`** per §14 and the §18.6 import paths — e.g. `github.com/ciram-co/flow/pkg/controlplane`)
+- Create (empty package dirs with a `doc.go` each): `pkg/uuid/`, `pkg/flow/`, `pkg/controlplane/`, `pkg/registry/`, `pkg/ingress/` (all service packages live **under `pkg/`** per §14 and the §18.6 import paths — e.g. `github.com/looprig/flow/pkg/controlplane`)
 
 **Steps:**
 1. `git init` (repo does not exist yet); confirm `CLAUDE.md`, `AGENTS.md`, `docs/` are present and untracked.
-2. Create `go.mod`: `module github.com/ciram-co/flow` with the current Go version (`go 1.23` or newer — generics + `min`/`max` builtins assumed).
+2. Create `go.mod`: `module github.com/looprig/flow` with the current Go version (`go 1.23` or newer — generics + `min`/`max` builtins assumed).
 3. Create `.gitignore` (binaries, `*.test`, coverage out, `*.prof`, editor dirs).
 4. Add a one-line `doc.go` package clause to each new dir so `go build ./...` succeeds on empty packages: `pkg/uuid/doc.go` → `// Package uuid is a stdlib-only v4 UUID. See design §13.`, etc.
 5. Run `CGO_ENABLED=0 go build -trimpath ./...` and `gofmt -l .` — both clean.
@@ -561,7 +561,7 @@
 
 **Steps:**
 1. Amend CLAUDE.md "Dependencies" section: add `github.com/nats-io/nats.go` and the embedded `github.com/nats-io/nats-server/v2` under approved packages, noting they are **confined to `pkg/nats`** (nested module) and **already sanctioned in looprig** (§18.4).
-2. Create `pkg/nats/go.mod` as a **nested module** (`module github.com/ciram-co/flow/pkg/nats`, `require github.com/ciram-co/flow` via `replace ../../` for local dev) so NATS never enters the core module's `go.sum` (§18.4).
+2. Create `pkg/nats/go.mod` as a **nested module** (`module github.com/looprig/flow/pkg/nats`, `require github.com/looprig/flow` via `replace ../../` for local dev) so NATS never enters the core module's `go.sum` (§18.4).
 3. `go get` NATS **inside `pkg/nats` only**; confirm the **core** module's `go mod graph` is still dependency-free.
 4. **Commit:** `chore(nats): record NATS dependency approval and add nested module (§18.4)`
 

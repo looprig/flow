@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/flow"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )

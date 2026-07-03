@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/flow"
 )
 
 // This file black-box tests the RunnerHandle JSON seam (§18.1): the non-generic,

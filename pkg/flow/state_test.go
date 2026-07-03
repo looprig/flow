@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/uuid"
+	"github.com/looprig/flow/pkg/uuid"
 )
 
 // TestRunStatusValues pins the iota ordering of RunStatus. These integer values

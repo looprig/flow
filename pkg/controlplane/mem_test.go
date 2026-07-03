@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/controlplane"
-	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/controlplane"
+	"github.com/looprig/flow/pkg/flow"
 )
 
 // This file black-box tests the in-process ControlPlane (§18.5): Submit→Consume

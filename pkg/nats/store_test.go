@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/flow/pkg/flow"
-	"github.com/ciram-co/flow/pkg/uuid"
+	"github.com/looprig/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/uuid"
 )
 
 // These are PURE, server-free tests of the subject-mapping and id-validation seam

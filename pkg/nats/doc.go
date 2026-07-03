@@ -5,7 +5,7 @@
 //
 // # Why this is a SEPARATE Go module
 //
-// The engine core (github.com/ciram-co/flow: pkg/flow, pkg/uuid) and the stdlib
+// The engine core (github.com/looprig/flow: pkg/flow, pkg/uuid) and the stdlib
 // service adapters (pkg/registry, pkg/controlplane, pkg/ingress) target ZERO
 // runtime dependencies (CLAUDE.md). NATS is a heavyweight external dependency, so
 // it is confined to this nested module (its own go.mod) — NATS therefore never

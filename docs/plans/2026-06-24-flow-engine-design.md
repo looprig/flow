@@ -3,7 +3,7 @@
 **Date:** 2026-06-24
 **Status:** Approved design, pre-implementation
 **Revision:** incorporates the 2026-06-25 design review (`docs/plans/2026-06-25-flow-engine-design-issues.md`)
-**Module:** `github.com/ciram-co/flow` (Go library, imported by callers; engine package `pkg/flow`)
+**Module:** `github.com/looprig/flow` (Go library, imported by callers; engine package `pkg/flow`)
 
 ---
 
@@ -652,13 +652,13 @@ A self-contained, **stdlib-only** UUID package (`pkg/uuid`) mirroring looprig's:
 
 ```
 flows/
-  go.mod                       // module github.com/ciram-co/flow — zero runtime deps
+  go.mod                       // module github.com/looprig/flow — zero runtime deps
   CLAUDE.md / AGENTS.md        // dev guidelines (done)
   docs/plans/                  // design docs
   pkg/
     uuid/                      // package `uuid`
       uuid.go uuid_test.go     // stdlib-only v4 UUID (mirrors looprig)
-    flow/                      // package `flow` — the engine; import "github.com/ciram-co/flow/pkg/flow"
+    flow/                      // package `flow` — the engine; import "github.com/looprig/flow/pkg/flow"
       ids.go                   // GraphID, VertexID, StepID, GraphRunID, VertexRunID
       state.go                 // GraphRunState, VertexState, RunInfo (+IdempotencyKey), RunStatus, VertexStatus
       task.go                  // Task[I,O], TaskFunc, FuncTask[I,O]
@@ -846,7 +846,7 @@ Separation costs **one import + a constructor swap** between tiers; everything e
 **Tier A — embed the library (zero deps, no service):**
 
 ```go
-import "github.com/ciram-co/flow/pkg/flow"
+import "github.com/looprig/flow/pkg/flow"
 
 runner, _ := g.Compile(intakeID, sendToSalesID, flow.WithStore(flow.NewMemStore())) // store set once
 res, _ := runner.Run(ctx, Request{Question: q})
@@ -857,10 +857,10 @@ res, _  = runner.Resume(ctx, res.Run.GraphRunID, approval) // later, on a webhoo
 
 ```go
 import (
-    "github.com/ciram-co/flow/pkg/flow"
-    "github.com/ciram-co/flow/pkg/controlplane"
-    "github.com/ciram-co/flow/pkg/registry"
-    "github.com/ciram-co/flow/pkg/ingress"
+    "github.com/looprig/flow/pkg/flow"
+    "github.com/looprig/flow/pkg/controlplane"
+    "github.com/looprig/flow/pkg/registry"
+    "github.com/looprig/flow/pkg/ingress"
 )
 store := flow.NewMemStore()
 runner, _ := g.Compile(intakeID, sendToSalesID, flow.WithStore(store)) // all registered runners use this store
@@ -873,7 +873,7 @@ http.ListenAndServe(":8080", ingress.New(reg, cp, store, ingress.WithAuth(auth))
 **Tier C — durable + distributed (one import + two constructors changed):**
 
 ```go
-import "github.com/ciram-co/flow/pkg/nats"          // the only new import
+import "github.com/looprig/flow/pkg/nats"          // the only new import
 nc := nats.Connect(url)                              // or nats.Embedded() for durable single-process
 cp, store := nats.ControlPlane(nc), nats.Store(nc)   // the only change vs Tier B
 runner, _ := g.Compile(intakeID, sendToSalesID, flow.WithStore(store))

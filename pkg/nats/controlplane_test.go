@@ -3,7 +3,7 @@ package nats
 import (
 	"testing"
 
-	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/flow"
 )
 
 // This file unit-tests the PURE helpers of the JetStream control plane (§18.5):

@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/flow"
-	"github.com/ciram-co/flow/pkg/uuid"
+	"github.com/looprig/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/uuid"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )

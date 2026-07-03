@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/flow"
 )
 
 // This file implements the in-process ControlPlane (design §18.5): a local,

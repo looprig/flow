@@ -45,8 +45,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/flow"
-	"github.com/ciram-co/flow/pkg/uuid"
+	"github.com/looprig/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/uuid"
 )
 
 // --- Pinned definition IDs (§3) ---------------------------------------------

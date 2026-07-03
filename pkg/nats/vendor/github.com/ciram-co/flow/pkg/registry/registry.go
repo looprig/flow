@@ -4,7 +4,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/flow"
 )
 
 // This file implements the (GraphID, GraphVersion) resolver (design §18.1): a

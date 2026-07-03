@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/flow"
 )
 
 // These are the Tier-B (service) smoke tests (§18.6). They exercise buildService

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/flow/pkg/uuid"
+	"github.com/looprig/flow/pkg/uuid"
 )
 
 // pinnedLiteral is the design §3 pinned UUID literal used to assert that

@@ -24,8 +24,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/ciram-co/flow/pkg/flow"
-	"github.com/ciram-co/flow/pkg/uuid"
+	"github.com/looprig/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/uuid"
 )
 
 // Pinned DEFINITION ids (§3). GraphID and VertexID are stable across process

@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ciram-co/flow/pkg/flow"
-	"github.com/ciram-co/flow/pkg/registry"
+	"github.com/looprig/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/registry"
 )
 
 // This file black-box tests the pure (GraphID, GraphVersion) resolver (§18.1):

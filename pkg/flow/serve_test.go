@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/controlplane"
-	"github.com/ciram-co/flow/pkg/flow"
-	"github.com/ciram-co/flow/pkg/registry"
+	"github.com/looprig/flow/pkg/controlplane"
+	"github.com/looprig/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/registry"
 )
 
 // This file black-box tests the Serve worker loop (§18.6): consume work for the

@@ -3,7 +3,7 @@ package ingress
 import (
 	"encoding/json"
 
-	"github.com/ciram-co/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/flow"
 )
 
 // This file defines the ingress response DTOs (design §18.3): the JSON-friendly

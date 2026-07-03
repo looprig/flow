@@ -29,11 +29,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ciram-co/flow/pkg/controlplane"
-	"github.com/ciram-co/flow/pkg/flow"
-	"github.com/ciram-co/flow/pkg/ingress"
-	"github.com/ciram-co/flow/pkg/registry"
-	"github.com/ciram-co/flow/pkg/uuid"
+	"github.com/looprig/flow/pkg/controlplane"
+	"github.com/looprig/flow/pkg/flow"
+	"github.com/looprig/flow/pkg/ingress"
+	"github.com/looprig/flow/pkg/registry"
+	"github.com/looprig/flow/pkg/uuid"
 )
 
 // listenAddr is the bind address for the demo service. A real deployment would
