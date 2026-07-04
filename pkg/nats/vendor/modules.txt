@@ -13,7 +13,7 @@ github.com/klauspost/compress/flate
 github.com/klauspost/compress/internal/le
 github.com/klauspost/compress/internal/race
 github.com/klauspost/compress/s2
-# github.com/looprig/core v0.0.0 => ../../../core
+# github.com/looprig/core v0.1.0 => ../../../core
 ## explicit; go 1.25.0
 github.com/looprig/core/uuid
 # github.com/looprig/flow v0.0.0-00010101000000-000000000000 => ../..
