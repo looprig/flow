@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/flow/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // This file tests the checkpoint data types (design §10.1). A checkpoint is the

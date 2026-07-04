@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/looprig/flow/pkg/flow"
-	"github.com/looprig/flow/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // These are PURE, server-free tests of the subject-mapping and id-validation seam

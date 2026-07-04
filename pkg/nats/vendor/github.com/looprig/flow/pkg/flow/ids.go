@@ -3,7 +3,7 @@ package flow
 import (
 	"strconv"
 
-	"github.com/looprig/flow/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // The identifier types of the engine (design §3). The four UUID-backed types are

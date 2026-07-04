@@ -2,6 +2,8 @@ module github.com/looprig/flow
 
 go 1.25.0
 
+require github.com/looprig/core v0.0.0
+
 require (
 	cloud.google.com/go v0.123.0 // indirect
 	cloud.google.com/go/auth v0.19.0 // indirect
@@ -63,3 +65,5 @@ tool (
 	golang.org/x/vuln/cmd/govulncheck
 	honnef.co/go/tools/cmd/staticcheck
 )
+
+replace github.com/looprig/core => ../core

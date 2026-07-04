@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/flow/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // TestRunStatusValues pins the iota ordering of RunStatus. These integer values

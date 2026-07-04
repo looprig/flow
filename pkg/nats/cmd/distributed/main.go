@@ -39,7 +39,7 @@ import (
 	"github.com/looprig/flow/pkg/ingress"
 	"github.com/looprig/flow/pkg/nats"
 	"github.com/looprig/flow/pkg/registry"
-	"github.com/looprig/flow/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // listenAddr is the bind address for the demo service. A real deployment would

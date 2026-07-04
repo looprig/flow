@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/looprig/flow/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // This file tests the GraphVersion compatibility fingerprint and the GraphID()/

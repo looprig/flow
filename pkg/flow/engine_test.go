@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/flow/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // This file white-box tests the BSP coordinator's super-step loop (§9.2): seed →
