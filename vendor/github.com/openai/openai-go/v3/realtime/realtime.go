@@ -43,14 +43,22 @@ type AudioTranscription struct {
 	//
 	// Any of "minimal", "low", "medium", "high", "xhigh".
 	Delay AudioTranscriptionDelay `json:"delay"`
+	// Words or phrases to guide transcription of the input audio. Supported by
+	// `gpt-transcribe` and `gpt-live-transcribe`.
+	Keywords []string `json:"keywords"`
 	// The language of the input audio. Supplying the input language in
 	// [ISO-639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) (e.g. `en`)
 	// format will improve accuracy and latency.
 	Language string `json:"language"`
+	// Possible languages of the input audio, in
+	// [ISO-639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) format.
+	// Supported by `gpt-transcribe` and `gpt-live-transcribe`.
+	Languages []string `json:"languages"`
 	// The model to use for transcription. Current options are `whisper-1`,
-	// `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`,
-	// `gpt-4o-transcribe`, `gpt-4o-transcribe-diarize`, and `gpt-realtime-whisper`.
-	// Use `gpt-4o-transcribe-diarize` when you need diarization with speaker labels.
+	// `gpt-transcribe`, `gpt-live-transcribe`, `gpt-4o-mini-transcribe`,
+	// `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe`,
+	// `gpt-4o-transcribe-diarize`, and `gpt-realtime-whisper`. Use
+	// `gpt-4o-transcribe-diarize` when you need diarization with speaker labels.
 	Model AudioTranscriptionModel `json:"model"`
 	// An optional text to guide the model's style or continue a previous audio
 	// segment. For `whisper-1`, the
@@ -62,7 +70,9 @@ type AudioTranscription struct {
 	// JSON contains metadata for fields, check presence with [respjson.Field.Valid].
 	JSON struct {
 		Delay       respjson.Field
+		Keywords    respjson.Field
 		Language    respjson.Field
+		Languages   respjson.Field
 		Model       respjson.Field
 		Prompt      respjson.Field
 		ExtraFields map[string]respjson.Field
@@ -99,13 +109,16 @@ const (
 )
 
 // The model to use for transcription. Current options are `whisper-1`,
-// `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`,
-// `gpt-4o-transcribe`, `gpt-4o-transcribe-diarize`, and `gpt-realtime-whisper`.
-// Use `gpt-4o-transcribe-diarize` when you need diarization with speaker labels.
+// `gpt-transcribe`, `gpt-live-transcribe`, `gpt-4o-mini-transcribe`,
+// `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe`,
+// `gpt-4o-transcribe-diarize`, and `gpt-realtime-whisper`. Use
+// `gpt-4o-transcribe-diarize` when you need diarization with speaker labels.
 type AudioTranscriptionModel string
 
 const (
 	AudioTranscriptionModelWhisper1                      AudioTranscriptionModel = "whisper-1"
+	AudioTranscriptionModelGPTTranscribe                 AudioTranscriptionModel = "gpt-transcribe"
+	AudioTranscriptionModelGPTLiveTranscribe             AudioTranscriptionModel = "gpt-live-transcribe"
 	AudioTranscriptionModelGPT4oMiniTranscribe           AudioTranscriptionModel = "gpt-4o-mini-transcribe"
 	AudioTranscriptionModelGPT4oMiniTranscribe2025_12_15 AudioTranscriptionModel = "gpt-4o-mini-transcribe-2025-12-15"
 	AudioTranscriptionModelGPT4oTranscribe               AudioTranscriptionModel = "gpt-4o-transcribe"
@@ -131,10 +144,18 @@ type AudioTranscriptionParam struct {
 	//
 	// Any of "minimal", "low", "medium", "high", "xhigh".
 	Delay AudioTranscriptionDelay `json:"delay,omitzero"`
+	// Words or phrases to guide transcription of the input audio. Supported by
+	// `gpt-transcribe` and `gpt-live-transcribe`.
+	Keywords []string `json:"keywords,omitzero"`
+	// Possible languages of the input audio, in
+	// [ISO-639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) format.
+	// Supported by `gpt-transcribe` and `gpt-live-transcribe`.
+	Languages []string `json:"languages,omitzero"`
 	// The model to use for transcription. Current options are `whisper-1`,
-	// `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`,
-	// `gpt-4o-transcribe`, `gpt-4o-transcribe-diarize`, and `gpt-realtime-whisper`.
-	// Use `gpt-4o-transcribe-diarize` when you need diarization with speaker labels.
+	// `gpt-transcribe`, `gpt-live-transcribe`, `gpt-4o-mini-transcribe`,
+	// `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe`,
+	// `gpt-4o-transcribe-diarize`, and `gpt-realtime-whisper`. Use
+	// `gpt-4o-transcribe-diarize` when you need diarization with speaker labels.
 	Model AudioTranscriptionModel `json:"model,omitzero"`
 	paramObj
 }
@@ -1069,6 +1090,8 @@ const (
 	RealtimeSessionCreateRequestModelGPTRealtime                        RealtimeSessionCreateRequestModel = "gpt-realtime"
 	RealtimeSessionCreateRequestModelGPTRealtime1_5                     RealtimeSessionCreateRequestModel = "gpt-realtime-1.5"
 	RealtimeSessionCreateRequestModelGPTRealtime2                       RealtimeSessionCreateRequestModel = "gpt-realtime-2"
+	RealtimeSessionCreateRequestModelGPTRealtime2_1                     RealtimeSessionCreateRequestModel = "gpt-realtime-2.1"
+	RealtimeSessionCreateRequestModelGPTRealtime2_1Mini                 RealtimeSessionCreateRequestModel = "gpt-realtime-2.1-mini"
 	RealtimeSessionCreateRequestModelGPTRealtime2025_08_28              RealtimeSessionCreateRequestModel = "gpt-realtime-2025-08-28"
 	RealtimeSessionCreateRequestModelGPT4oRealtimePreview               RealtimeSessionCreateRequestModel = "gpt-4o-realtime-preview"
 	RealtimeSessionCreateRequestModelGPT4oRealtimePreview2024_10_01     RealtimeSessionCreateRequestModel = "gpt-4o-realtime-preview-2024-10-01"
@@ -1220,6 +1243,14 @@ func (u RealtimeToolsConfigUnionParam) GetServerLabel() *string {
 }
 
 // Returns a pointer to the underlying variant's property, if present.
+func (u RealtimeToolsConfigUnionParam) GetAllowedCallers() []string {
+	if vt := u.OfMcp; vt != nil {
+		return vt.AllowedCallers
+	}
+	return nil
+}
+
+// Returns a pointer to the underlying variant's property, if present.
 func (u RealtimeToolsConfigUnionParam) GetAllowedTools() *RealtimeToolsConfigUnionMcpAllowedToolsParam {
 	if vt := u.OfMcp; vt != nil {
 		return &vt.AllowedTools
@@ -1284,6 +1315,14 @@ func (u RealtimeToolsConfigUnionParam) GetServerURL() *string {
 }
 
 // Returns a pointer to the underlying variant's property, if present.
+func (u RealtimeToolsConfigUnionParam) GetTunnelID() *string {
+	if vt := u.OfMcp; vt != nil && vt.TunnelID.Valid() {
+		return &vt.TunnelID.Value
+	}
+	return nil
+}
+
+// Returns a pointer to the underlying variant's property, if present.
 func (u RealtimeToolsConfigUnionParam) GetType() *string {
 	if vt := u.OfFunction; vt != nil {
 		return (*string)(&vt.Type)
@@ -1317,9 +1356,16 @@ type RealtimeToolsConfigUnionMcpParam struct {
 	DeferLoading param.Opt[bool] `json:"defer_loading,omitzero"`
 	// Optional description of the MCP server, used to provide more context.
 	ServerDescription param.Opt[string] `json:"server_description,omitzero"`
-	// The URL for the MCP server. One of `server_url` or `connector_id` must be
-	// provided.
+	// The URL for the MCP server. One of `server_url`, `connector_id`, or `tunnel_id`
+	// must be provided.
 	ServerURL param.Opt[string] `json:"server_url,omitzero" format:"uri"`
+	// The Secure MCP Tunnel ID to use instead of a direct server URL. One of
+	// `server_url`, `connector_id`, or `tunnel_id` must be provided.
+	TunnelID param.Opt[string] `json:"tunnel_id,omitzero"`
+	// The tool invocation context(s).
+	//
+	// Any of "direct", "programmatic".
+	AllowedCallers []string `json:"allowed_callers,omitzero"`
 	// List of allowed tool names or a filter object.
 	AllowedTools RealtimeToolsConfigUnionMcpAllowedToolsParam `json:"allowed_tools,omitzero"`
 	// Optional HTTP headers to send to the MCP server. Use for authentication or other
@@ -1328,8 +1374,8 @@ type RealtimeToolsConfigUnionMcpParam struct {
 	// Specify which of the MCP server's tools require approval.
 	RequireApproval RealtimeToolsConfigUnionMcpRequireApprovalParam `json:"require_approval,omitzero"`
 	// Identifier for service connectors, like those available in ChatGPT. One of
-	// `server_url` or `connector_id` must be provided. Learn more about service
-	// connectors
+	// `server_url`, `connector_id`, or `tunnel_id` must be provided. Learn more about
+	// service connectors
 	// [here](https://platform.openai.com/docs/guides/tools-remote-mcp#connectors).
 	//
 	// Currently supported `connector_id` values are:

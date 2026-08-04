@@ -1,5 +1,87 @@
 # Changelog
 
+## [1.66.0](https://github.com/googleapis/go-genai/compare/v1.65.0...v1.66.0) (2026-07-28)
+
+
+### Features
+
+* [GenerateContentConfig] Add GenerationConfig.audio_transcription_config and Part.audio_transcription. ([5d6dfc2](https://github.com/googleapis/go-genai/commit/5d6dfc276d582566522b43a30d13b65a15fb690c))
+* Add flat `language_codes` field to `AudioTranscriptionConfig`. ([3169529](https://github.com/googleapis/go-genai/commit/31695296338b0b960b6374da101fca7398462867))
+* Allow api key + proj/location for enterprise mode ([7357166](https://github.com/googleapis/go-genai/commit/7357166cc0623eefb548af9a11d4d85499d3a62a))
+
+## [1.65.0](https://github.com/googleapis/go-genai/compare/v1.64.0...v1.65.0) (2026-07-21)
+
+
+### Features
+
+* A new field `custom_vocabulary` is added to message `.google.cloud.aiplatform.v1beta1.BidiGenerateContentSetup` ([7d5b833](https://github.com/googleapis/go-genai/commit/7d5b83362d9304343ea33eb0eac6462bcaeb589e))
+
+
+### Bug Fixes
+
+* add deprecation warnings to Imagen generate_images, edit_images, generate_videos (if using prompt/text/image args), LiveConnectConfig.GenerationConfig which will be removed in the next major version ([d77df44](https://github.com/googleapis/go-genai/commit/d77df44a722d1748666910bef14fa0c8852e12f7))
+* Fix streaming truncation when HTTPOptions.Timeout is set. ([3417576](https://github.com/googleapis/go-genai/commit/3417576059b7e8c3ad058bcbc5ebf12611d1f4a9)), closes [#816](https://github.com/googleapis/go-genai/issues/816)
+
+## [1.64.0](https://github.com/googleapis/go-genai/compare/v1.63.0...v1.64.0) (2026-07-15)
+
+
+### Features
+
+* Add history config. ([315c1b1](https://github.com/googleapis/go-genai/commit/315c1b1e439c31f7b84c0f026cafdeb6b0cc8e54))
+* Populate per-modality prompt token count in embedding responses for gemini-embedding-2 ([7e186ba](https://github.com/googleapis/go-genai/commit/7e186ba131512a5bc87f27c7b3cf9882d66b55fd))
+
+## [1.63.0](https://github.com/googleapis/go-genai/compare/v1.62.0...v1.63.0) (2026-07-15)
+
+
+### Features
+
+* Add history config. ([315c1b1](https://github.com/googleapis/go-genai/commit/315c1b1e439c31f7b84c0f026cafdeb6b0cc8e54))
+* Add response_format and Translation_config in GenerationConfig ([caf2595](https://github.com/googleapis/go-genai/commit/caf25953db65011cd903d2b08631ea78e37c0a32))
+* Add Tool.exa_ai_search for Gemini Enterprise API ([caf2595](https://github.com/googleapis/go-genai/commit/caf25953db65011cd903d2b08631ea78e37c0a32))
+* Populate per-modality prompt token count in embedding responses for gemini-embedding-2 ([7e186ba](https://github.com/googleapis/go-genai/commit/7e186ba131512a5bc87f27c7b3cf9882d66b55fd))
+* voice consent signature types across all SDK languages. ([ff4e260](https://github.com/googleapis/go-genai/commit/ff4e26052344e10a1364f9f5d45c52615c90ed26))
+
+
+### Bug Fixes
+
+* Fix exponential backoff bug in Go GenAI SDK. ([55b57b9](https://github.com/googleapis/go-genai/commit/55b57b95b75ffcc2413c76cea94c32002cc48e1d))
+
+## [1.62.0](https://github.com/googleapis/go-genai/compare/v1.61.0...v1.62.0) (2026-06-24)
+
+
+### Features
+
+* Add ComputerUse.disabled_safety_policies ([c89e5eb](https://github.com/googleapis/go-genai/commit/c89e5eb0e45b11805adf87d419016e219b8ef5a9))
+
+## [1.61.0](https://github.com/googleapis/go-genai/compare/v1.60.0...v1.61.0) (2026-06-17)
+
+
+### Features
+
+* Add audioOffset to VoiceActivity ([43a352f](https://github.com/googleapis/go-genai/commit/43a352fc5ceafff366259afececc0d816f0c3816))
+* Add interimInputTranscription to LiveServerContent ([43a352f](https://github.com/googleapis/go-genai/commit/43a352fc5ceafff366259afececc0d816f0c3816))
+* Add LanguageAuto, LanguageHints, and adaptationPhrases to AudioTranscriptionConfig ([43a352f](https://github.com/googleapis/go-genai/commit/43a352fc5ceafff366259afececc0d816f0c3816))
+
+## [1.60.0](https://github.com/googleapis/go-genai/compare/v1.59.0...v1.60.0) (2026-06-04)
+
+
+### Features
+
+* Add ServiceTier to UsageMetadata ([74b1290](https://github.com/googleapis/go-genai/commit/74b1290a5c5cfef6ad8e8263ffc6aed8b4c4d865))
+
+## [1.59.0](https://github.com/googleapis/go-genai/compare/v1.58.0...v1.59.0) (2026-06-03)
+
+
+### Features
+
+* Add Agent Platform MCP support to async generate_content ([4b138c2](https://github.com/googleapis/go-genai/commit/4b138c23dba7df1d76626fbc4565d4838469ce96))
+* Add transcription language code. ([cc4dd9c](https://github.com/googleapis/go-genai/commit/cc4dd9cdd6e3c09044493c439c89cb67254539de))
+* Add TranslationConfig for live translation. ([76f4126](https://github.com/googleapis/go-genai/commit/76f4126a18dbb6c4606f649e1f8400003364f785))
+* additional computer_use field support for vertex. ([8831eb3](https://github.com/googleapis/go-genai/commit/8831eb39c99879b30695b3c1262d70a0b2b25450))
+* Support 'additionalProperties', 'defs' and 'ref' in the GenerateContent.Schema type. ([996b831](https://github.com/googleapis/go-genai/commit/996b8316fdc4dfe1bb5d70e3af45542a4a55bf9e))
+* Support Reinforcement Tuning in GenAI SDK ([fecb49e](https://github.com/googleapis/go-genai/commit/fecb49e3d7870921be23054457b7b5163b8bba4f))
+* Support ReinforcementTuning in GenAI SDK including ValidateReward API method. ([c95d115](https://github.com/googleapis/go-genai/commit/c95d115482daa0e69a02b25c239bd232bf62f054))
+
 ## [1.58.0](https://github.com/googleapis/go-genai/compare/v1.57.0...v1.58.0) (2026-05-21)
 
 
