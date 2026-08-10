@@ -1,0 +1,5 @@
+github.com/looprig/core v0.5.0 h1:o4Yy96e0gcJvTSBTzHS7ZKvFO4E+imf8BJ3j1dsUxAo=
+github.com/looprig/core v0.5.0/go.mod h1:qRhd1Wb35dlJ8xWD4e9sGrymFweR2aWek6py83C/+BA=
+github.com/securego/gosec/v2 v2.28.0/go.mod h1:lb4/9AHe+lJy/kjWmWRWWsEipvbwGKuxf+tY1Pmjdnk=
+golang.org/x/vuln v1.6.0/go.mod h1:bWlG2493/sjR7ksvicBgMrznH3eYQEyK8ifUYBrqUbg=
+honnef.co/go/tools v0.7.0/go.mod h1:pm29oPxeP3P82ISxZDgIYeOaf9ta6Pi0EWvCFoLG2vc=
