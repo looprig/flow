@@ -42,8 +42,7 @@ This file is **how we build**, not **what we build**. The architecture, types, e
 
 <!-- Approved external packages -->
 - _Engine core (`pkg/flow`, `pkg/uuid`) and the stdlib service adapters (`pkg/registry`, `pkg/controlplane`, `pkg/ingress`): **zero runtime dependencies** — this is non-negotiable and verified by `go mod graph` at the repo root._
-- `github.com/nats-io/nats.go` — JetStream client for the optional Tier-C distribution adapter (durable `CheckpointStore` + distributed `ControlPlane`). **Confined to the `pkg/nats` nested Go module** (its own `go.mod`), so NATS never enters the core module's `go.sum`. Approved by the user at session start ("Everything incl. NATS"); already sanctioned in sibling project `looprig` (design §18.4).
-- `github.com/nats-io/nats-server/v2` — embedded in-process JetStream server, used only by `pkg/nats`'s `Embedded()` (single-process durable runs) and its integration tests. **Confined to `pkg/nats`** (same nested module); never linked into the core.
+- Concrete storage and transport adapters are separate repositories or nested modules. They must not be imported by the core module; `flow/store` is the optional neutral-ledger adapter and distributed worker dispatch belongs in a future adapter.
 
 Dev/tool-only (not linked into the library) may be added as approved:
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)

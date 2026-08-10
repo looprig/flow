@@ -89,8 +89,15 @@ if result.Run.Status == flow.RunInterrupted {
 - Zero runtime third-party dependencies.
 - Race-clean execution under `go test -race`.
 
+## Storage and dispatch boundaries
+
+The core module depends only on its neutral `CheckpointStore` and
+`ControlPlane` interfaces. The optional `github.com/looprig/flow/store` nested
+module adapts a caller-supplied `storage.Ledger`; concrete local or distributed
+backends remain outside the core module. Distributed worker dispatch is a
+separate future adapter, not a package in this repository.
+
 ## Current Docs
 
 - [Engine design](docs/plans/2026-06-24-flow-engine-design.md)
 - [Design review notes](docs/plans/2026-06-25-flow-engine-design-issues.md)
-

@@ -1,4 +1,4 @@
-.PHONY: test fmt fmt-check lint vuln secure fuzz build check
+.PHONY: test fmt fmt-check architecture lint vuln secure fuzz build check
 
 # A parent go.work at ../go.work does not list this repo, so every go/gofmt
 # command must run with GOWORK=off (workspace mode also disables -mod=vendor).
@@ -31,6 +31,9 @@ fmt-check:
 build:
 	CGO_ENABLED=0 go build -trimpath ./...
 
+architecture:
+	go test . -run TestCoreHasNoConcreteBackendDependencies
+
 lint: fmt-check
 	go vet ./...
 	go tool staticcheck ./...
@@ -48,4 +51,4 @@ secure: lint vuln
 fuzz:
 	@echo "Usage: go test -fuzz=FuzzXxx ./path/to/pkg -fuzztime=30s"
 
-check: secure build test
+check: architecture secure build test
