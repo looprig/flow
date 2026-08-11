@@ -24,8 +24,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/looprig/flow/pkg/flow"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/flow/pkg/flow"
 )
 
 // Pinned DEFINITION ids (§3). GraphID and VertexID are stable across process

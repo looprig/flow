@@ -10,20 +10,22 @@ export GOWORK := off
 export GOFLAGS := -mod=vendor
 
 # This module's own package dirs, excluding vendor/ and any nested modules
-# (go list ./... stops at module boundaries and skips vendor). Scopes gofmt/gosec.
+# (go list ./... stops at module boundaries and skips vendor). GO_DIRS scopes
+# gosec; GO_FILES keeps gofmt's recursive directory walk out of vendor/.
 # GOWORK=off is inlined here because make's `export` applies only to recipes,
 # not to this parse-time $(shell); the parent go.work omits this repo, so a bare
 # `go list` would fail and leave GO_DIRS empty.
 GO_DIRS := $(shell GOWORK=off go list -f '{{.Dir}}' ./...)
+GO_FILES := $(foreach dir,$(GO_DIRS),$(wildcard $(dir)/*.go))
 
 test:
 	go test -race ./...
 
 fmt:
-	gofmt -w $(GO_DIRS)
+	gofmt -w $(GO_FILES)
 
 fmt-check:
-	@unformatted=$$(gofmt -l $(GO_DIRS)); \
+	@unformatted=$$(gofmt -l $(GO_FILES)); \
 	if [ -n "$$unformatted" ]; then \
 		echo "gofmt needed (run 'make fmt'):"; echo "$$unformatted"; exit 1; \
 	fi
