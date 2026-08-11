@@ -1,0 +1,118 @@
+{
+  "schemaVersion": 1,
+  "repository": "flow",
+  "proofSources": [
+    {
+      "id": "example-flow-graph-deterministic-execution-source",
+      "type": "executable-fixture",
+      "path": "examples/graph/example_test.go",
+      "symbol": "Example_deterministicExecution"
+    },
+    {
+      "id": "example-flow-branch-conditional-routing-source",
+      "type": "executable-fixture",
+      "path": "examples/branch/example_test.go",
+      "symbol": "Example_conditionalRouting"
+    },
+    {
+      "id": "example-flow-interrupt-typed-awaiting-source",
+      "type": "executable-fixture",
+      "path": "examples/interrupt/example_test.go",
+      "symbol": "Example_typedInterruption"
+    },
+    {
+      "id": "example-flow-resume-checkpoint-continuation-source",
+      "type": "executable-fixture",
+      "path": "examples/resume/example_test.go",
+      "symbol": "Example_checkpointResume"
+    },
+    {
+      "id": "example-flow-artifacts-contract-test",
+      "type": "test",
+      "path": "tests/example_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-flow-graph-deterministic-execution",
+      "ecosystem": "go",
+      "owner": "flow",
+      "sourcePath": "examples/graph/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/flow": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "Go example output proves public graph construction, typed build validation, deterministic state reduction, completed lifecycle status, and ordered run hooks.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No cleanup required; the compiled runner uses its process-local default checkpoint store.",
+      "liveGate": null,
+      "proofIds": [
+        "example-flow-graph-deterministic-execution-source",
+        "example-flow-artifacts-contract-test"
+      ]
+    },
+    {
+      "id": "example-flow-branch-conditional-routing",
+      "ecosystem": "go",
+      "owner": "flow",
+      "sourcePath": "examples/branch/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/flow": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "Go example output proves declared conditional routing selects both branches deterministically and surfaces a failed condition as a typed run-level halt.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No cleanup required; all three runs and checkpoints remain in process-local memory.",
+      "liveGate": null,
+      "proofIds": [
+        "example-flow-branch-conditional-routing-source",
+        "example-flow-artifacts-contract-test"
+      ]
+    },
+    {
+      "id": "example-flow-interrupt-typed-awaiting",
+      "ecosystem": "go",
+      "owner": "flow",
+      "sourcePath": "examples/interrupt/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/flow": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "Go example output proves a task-requested pause returns RunInterrupted with an Awaiting Interruption, stable vertex identity, user-facing info, and an interruption hook.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No cleanup required; the interruption checkpoint uses a process-local in-memory store.",
+      "liveGate": null,
+      "proofIds": [
+        "example-flow-interrupt-typed-awaiting-source",
+        "example-flow-artifacts-contract-test"
+      ]
+    },
+    {
+      "id": "example-flow-resume-checkpoint-continuation",
+      "ecosystem": "go",
+      "owner": "flow",
+      "sourcePath": "examples/resume/example_test.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/flow": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go test -race ./...",
+      "assertion": "Go example output proves an awaiting checkpoint preserves committed state and continuation data, ResumePayload completes the same run with growing history, and terminal resume returns a typed error.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "No cleanup required; checkpoint history is held only by the explicitly supplied process-local MemStore.",
+      "liveGate": null,
+      "proofIds": [
+        "example-flow-resume-checkpoint-continuation-source",
+        "example-flow-artifacts-contract-test"
+      ]
+    }
+  ]
+}

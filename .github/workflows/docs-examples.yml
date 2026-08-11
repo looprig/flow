@@ -1,0 +1,24 @@
+name: Documentation examples
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-examples:
+    runs-on: ubuntu-latest
+    env:
+      GOCACHE: ${{ runner.temp }}/go-build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Run repository checks
+        run: GOWORK=off make check
+      - name: Run standalone race suite and examples
+        run: GOWORK=off go test -race ./...
