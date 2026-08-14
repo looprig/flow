@@ -28,6 +28,3 @@ coverage.*
 # GOWORK=off build actually resolves. Ignored so a stray `go mod vendor` cannot
 # be committed by accident.
 /vendor/
-
-# Nested module/repository; released independently and never staged in flow.
-/store/
