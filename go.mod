@@ -2,7 +2,7 @@ module github.com/looprig/flow
 
 go 1.26.6
 
-require github.com/looprig/core v0.5.1
+require github.com/looprig/core v0.6.0
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
