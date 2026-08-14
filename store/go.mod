@@ -9,10 +9,10 @@ tool (
 )
 
 require (
-	github.com/looprig/core v0.5.1
-	github.com/looprig/flow v0.3.0
-	github.com/looprig/fsstore v0.3.2
-	github.com/looprig/storage v0.3.1
+	github.com/looprig/core v0.6.0
+	github.com/looprig/flow v0.4.0
+	github.com/looprig/fsstore v0.4.0
+	github.com/looprig/storage v0.4.0
 )
 
 require (
