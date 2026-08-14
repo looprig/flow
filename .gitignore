@@ -22,9 +22,12 @@ coverage.*
 .vscode/
 .DS_Store
 
-# Vendored dependency tree — committed in full and built offline (-mod=vendor).
-# The global ignores above (*.a, *.o, *.so, *.test, *.out, coverage.*, *.prof,
-# ...) otherwise silently drop matching vendored files, yielding a tree that
-# fails `go build`/`go test` from a clean checkout. This negation must stay
-# LAST so it re-includes everything under vendor/.
-!/vendor/**
+# This module does not vendor. go.mod pins exact versions and go.sum verifies
+# their content hashes; a vendor tree would add only offline builds and
+# source-level dependency diffs, at the cost of masking which version a
+# GOWORK=off build actually resolves. Ignored so a stray `go mod vendor` cannot
+# be committed by accident.
+/vendor/
+
+# Nested module/repository; released independently and never staged in flow.
+/store/

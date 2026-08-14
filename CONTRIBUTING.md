@@ -72,10 +72,15 @@ gate before opening a PR. Integration tests are tagged
 external input: `go test -fuzz=FuzzXxx ./path/to/pkg -fuzztime=30s` (`make
 fuzz` prints the usage reminder).
 
-This module builds from a vendored dependency tree (`GOFLAGS=-mod=vendor`)
-for offline, reproducible, auditable builds — every dependency's source is
-visible in `vendor/` and shows up in review diffs. Don't run `go get`
-casually or hand-edit `vendor/`.
+**Dependencies are pinned, not vendored.** `go.mod` pins exact versions and
+`go.sum` verifies their content hashes, which is what makes a build
+reproducible. This module deliberately has no `vendor/`: a vendor tree is
+ignored under a `go.work` but silently satisfies a `GOWORK=off` build, so a
+stale one lets standalone verification pass against the vendored copy rather
+than the version `go.mod` actually pins — defeating the purpose of verifying
+standalone. The Makefile exports `GOWORK=off`, so every target already checks
+this module against its real pinned dependencies. Don't run `go get`
+casually.
 
 ## Tests
 

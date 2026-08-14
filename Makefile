@@ -1,20 +1,27 @@
 .PHONY: test fmt fmt-check architecture lint vuln secure fuzz build check
 
-# A parent go.work at ../go.work does not list this repo, so every go/gofmt
-# command must run with GOWORK=off (workspace mode also disables -mod=vendor).
+# This module does not vendor. go.mod pins exact versions and go.sum verifies
+# their content hashes, which is what makes a build reproducible; a vendor tree
+# adds only offline builds and source-level dependency diffs. It also actively
+# misleads: a stale vendor/ is ignored under a go.work but silently satisfies a
+# GOWORK=off build, so standalone verification tests the vendored copy rather
+# than the version go.mod actually pins — which is precisely what standalone
+# verification exists to check.
+#
+# Every target therefore runs standalone: ../go.work does list this repo, but
+# these checks deliberately resolve dependencies from the versions go.mod pins
+# rather than from sibling working copies. This module has no replace
+# directives, so nothing here needs the workspace.
 export GOWORK := off
 
-# Build from the vendored dependency tree: offline, reproducible, auditable
-# (every dep's source lives in vendor/ and shows up in review diffs). Export
-# -mod=vendor so a stray global GOFLAGS can't switch off the vendored tree.
-export GOFLAGS := -mod=vendor
-
-# This module's own package dirs, excluding vendor/ and any nested modules
-# (go list ./... stops at module boundaries and skips vendor). GO_DIRS scopes
-# gosec; GO_FILES keeps gofmt's recursive directory walk out of vendor/.
+# This module's own package dirs (go list ./... stops at nested module
+# boundaries). GO_DIRS scopes gosec, which takes package dirs. Never hand
+# GO_DIRS to gofmt: gofmt recurses into directory operands, and for a module
+# with a root package GO_DIRS contains the module root, so gofmt would walk the
+# entire tree. GO_FILES expands to each package dir's own .go files (including
+# platform-specific ones go list omits for the host) without descending.
 # GOWORK=off is inlined here because make's `export` applies only to recipes,
-# not to this parse-time $(shell); the parent go.work omits this repo, so a bare
-# `go list` would fail and leave GO_DIRS empty.
+# not to this parse-time $(shell).
 GO_DIRS := $(shell GOWORK=off go list -f '{{.Dir}}' ./...)
 GO_FILES := $(foreach dir,$(GO_DIRS),$(wildcard $(dir)/*.go))
 
@@ -40,8 +47,8 @@ lint: fmt-check
 	go vet ./...
 	go tool staticcheck ./...
 	# gosec is not module-aware (its ./... is a filesystem walk that would descend
-	# into nested modules like the future pkg/nats under -mod=vendor); scope it to
-	# this module's own dirs via GO_DIRS. vet/staticcheck are module-aware.
+	# into nested modules such as store/); scope it to this module's own dirs via
+	# GO_DIRS. vet/staticcheck are module-aware.
 	go tool gosec $(GO_DIRS)
 
 vuln:

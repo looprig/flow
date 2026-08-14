@@ -65,7 +65,7 @@ Dev/tool-only (not linked into the library) may be added as approved:
 
 **Build** — `CGO_ENABLED=0 go build -trimpath ./...`. Never ship a binary without `-trimpath` (leaks local paths).
 
-**Format** — All Go code must be `gofmt`-clean (`gofmt -l .` reports nothing). Never reformat vendored or worktree files.
+**Format** — All Go code must be `gofmt`-clean. Run `make fmt`/`make fmt-check`, which are scoped to this module's own package files via `GO_FILES`. Never reformat files belonging to the nested `store/` module or to worktree checkouts.
 
 **Tests** — Always run with `-race`: `go test -race ./...`. A test that passes without `-race` but not with it is not passing. Concurrency is core here, so race coverage is non-negotiable.
 
