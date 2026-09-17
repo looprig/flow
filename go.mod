@@ -1,6 +1,6 @@
 module github.com/looprig/flow
 
-go 1.26.6
+go 1.26.8
 
 require github.com/looprig/core v0.6.1
 
