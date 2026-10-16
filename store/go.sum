@@ -59,8 +59,8 @@ github.com/invopop/jsonschema v0.14.0 h1:MHQqLhvpNUZfw+hM3AZDYK7jxO8FZoQeQM77g8i
 github.com/invopop/jsonschema v0.14.0/go.mod h1:ygm6C2EaVNMBDPpaPlnOA2pFAxBnxGjFlMZABxm9n2I=
 github.com/looprig/core v0.13.2 h1:ecxrhXSd9FL7lja5CtUF0elRdoKpiWufjsqZKRo7x08=
 github.com/looprig/core v0.13.2/go.mod h1:QOmKNPPzrjMyt8kWMVH5j6nTrQ3FPsfjKP3xKRCkQxM=
-github.com/looprig/flow v0.4.4 h1:7/IZdG2+9UcK672XeeWSUIawkAOQsIcMJXG3/6afcdw=
-github.com/looprig/flow v0.4.4/go.mod h1:R6CbsojCwTdfIY79OmiyksUyf3TzzRKB2F9M6IrNOZY=
+github.com/looprig/flow v0.4.5 h1:QWhaL6DgGKBmlcV0BPDv+mTOxOnUDWBqg1HflHuORig=
+github.com/looprig/flow v0.4.5/go.mod h1:iWD93VwqXV2GCBD8HwYuolQocsymcpLzLSMpHo7zgAA=
 github.com/looprig/fsstore v0.6.2 h1:weZ7HS7Dx64AB4XNuhLMAHbwx1uTsdVySygXg5iFn8s=
 github.com/looprig/fsstore v0.6.2/go.mod h1:WcTxW8eQ14fhvoqQnhwK71HKPNRbRExzoraQuZxcWXA=
 github.com/looprig/storage v0.9.1 h1:oQThNB51xNgqhqZCeqzlJqLctfzDWcd/LvOoCJTz9CM=

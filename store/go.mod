@@ -10,7 +10,7 @@ tool (
 
 require (
 	github.com/looprig/core v0.13.2
-	github.com/looprig/flow v0.4.4
+	github.com/looprig/flow v0.4.5
 	github.com/looprig/fsstore v0.6.2
 	github.com/looprig/storage v0.9.1
 )
