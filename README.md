@@ -145,7 +145,7 @@ module is tier 2 (`flow/store -> flow, storage`, with test-only `core` and
 
 ## Development
 
-The Go baseline is 1.26.8. Every Makefile target runs with `GOWORK=off`.
+The Go baseline is 1.26.9. Every Makefile target runs with `GOWORK=off`.
 
 ```sh
 GOWORK=off go test ./...   # standalone tests

@@ -43,7 +43,7 @@ Tier 2 of the Looprig workspace. Production dependencies: `flow` and
 
 ## Development
 
-The Go baseline is 1.26.8. Run from this directory:
+The Go baseline is 1.26.9. Run from this directory:
 
 ```sh
 GOWORK=off go test ./...
